@@ -1212,17 +1212,17 @@ export default function App() {
     return target;
   };
 
-  const handleExportXlsx = () => {
+  const handleExportXlsx = async () => {
     const target = getExportTarget();
     if (!target) return;
-    downloadXlsx(target, reconciliation, exportLayout);
-    setMessage(`Planilha Excel exportada (${target.length} lançamentos).`);
+    await downloadXlsx(target, reconciliation, exportLayout);
+    setMessage(`Planilha Excel exportada (${target.length} lançamentos na aba Lançamentos).`);
   };
 
   const handleExportCsv = () => {
     const target = getExportTarget();
     if (!target) return;
-    downloadCsv(target, exportLayout);
+    downloadCsv(target, exportLayout, reconciliation);
     setMessage(`Arquivo CSV exportado (${target.length} lançamentos).`);
   };
 
@@ -1678,7 +1678,7 @@ export default function App() {
                 onChange={(e) => setExportLayout(e.target.value as ExportLayout)}
               >
                 <option value="contabil">Modelo Contábil (Data · Débito · Crédito · Histórico)</option>
-                <option value="completo">Auditoria Completa (11 colunas + 3 abas)</option>
+                <option value="completo">Modelo Completo (Data · Doc. · Histórico · Débito · Crédito · Saldo)</option>
               </select>
 
               {filteredTransactions.length !== transactions.length && (

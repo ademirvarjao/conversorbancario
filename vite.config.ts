@@ -1,9 +1,24 @@
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig({
+const rootDir = dirname(fileURLToPath(import.meta.url));
+
+export default defineConfig(({ mode }) => ({
   base: './',
   plugins: [react()],
+  resolve: {
+    alias:
+      mode === 'test'
+        ? []
+        : [
+            {
+              find: /^exceljs$/,
+              replacement: resolve(rootDir, 'node_modules/exceljs/dist/exceljs.min.js'),
+            },
+          ],
+  },
   test: {
     setupFiles: ['./vitest.setup.ts'],
   },
@@ -22,6 +37,6 @@ export default defineConfig({
   build: {
     target: 'es2022',
     sourcemap: false,
-    chunkSizeWarningLimit: 1200,
+    chunkSizeWarningLimit: 2500,
   },
-});
+}));

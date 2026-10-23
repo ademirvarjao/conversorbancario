@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseMonetaryValue, parseUnifiedStatement, readDate } from './bankParser';
 import { mergeWithSmartDedup } from './dedup';
+import { buildCsvContent, buildWorkbook } from './exporters';
 import { recordIgnoredRowInModel, recordSignCorrectionInModel } from './layoutAgent';
 import { computeReconciliation } from './reconciliation';
 
@@ -303,5 +304,43 @@ OFXHEADER:100
     const merged = mergeWithSmartDedup(parsedOfx.transactions, parsedCsv.transactions, true);
     expect(merged.duplicatesCount).toBe(1);
     expect(merged.records).toHaveLength(4);
+  });
+
+  it('exporta XLSX e CSV apenas com a aba Lançamentos, sem símbolo $ e com colunas auto-ajustadas', async () => {
+    const csvSample = [
+      'Data;Histórico;Valor',
+      '05/03/2026;RECEBIMENTO PIX CONTRATO CORPORATIVO DE LONGO PRAZO REFERENTE A PRESTACAO DE SERVICOS MENSAIS;125430,85',
+      '08/03/2026;PAGAMENTO BOLETO ENERGIA ELETRICA;-980,40',
+    ].join('\n');
+    const csvFile = new File([csvSample], 'extrato-teste-export.csv', { type: 'text/csv' });
+    const parsed = await parseUnifiedStatement(csvFile);
+    const rec = computeReconciliation(parsed.transactions, parsed.openingBalance);
+
+    for (const layout of ['contabil', 'completo'] as const) {
+      const wb = await buildWorkbook(parsed.transactions, rec, layout);
+      expect(wb.worksheets.map((s) => s.name)).toEqual(['Lançamentos']);
+
+      const ws = wb.worksheets[0];
+      ws.eachRow((row) => {
+        row.eachCell((cell) => {
+          expect(cell.numFmt ?? '').not.toContain('$');
+          if (typeof cell.value === 'string') {
+            expect(cell.value).not.toContain('$');
+          }
+        });
+      });
+
+      const widths = ws.columns.map((c) => c.width ?? 0);
+      expect(Math.max(...widths)).toBeGreaterThan(85);
+      expect(Math.min(...widths)).toBeGreaterThanOrEqual(12);
+
+      const outBuffer = await wb.xlsx.writeBuffer();
+      expect(outBuffer.byteLength).toBeGreaterThan(2000);
+
+      const csvOut = buildCsvContent(parsed.transactions, layout, rec);
+      expect(csvOut).not.toContain('$');
+      expect(csvOut).toContain('125.430,85');
+      expect(csvOut).toContain('980,40');
+    }
   });
 });
