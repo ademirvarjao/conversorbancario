@@ -59,6 +59,60 @@ function buildPositionedPdfFile(
   return new File([bytes], name, { type: 'application/pdf' });
 }
 
+function buildMultiPagePositionedPdfFile(
+  name: string,
+  pagesDraw: Array<(put: (text: string, x: number, yFromTop: number) => void) => void>,
+): File {
+  const escapePdfString = (str: string) =>
+    str.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+
+  const pageStreams = pagesDraw.map((draw) => {
+    const ops: PdfTextOp[] = [];
+    draw((text, x, yFromTop) => ops.push({ text, x, y: 842 - yFromTop }));
+    return [
+      'BT',
+      '/F1 9 Tf',
+      ...ops.map((op) => `1 0 0 1 ${op.x} ${op.y} Tm (${escapePdfString(op.text)}) Tj`),
+      'ET',
+    ].join('\n');
+  });
+
+  // Obj 1: Catalog, Obj 2: Pages, Obj 3: Font, then pairs (pageObj, streamObj) per page
+  const kidsRefs = pageStreams.map((_, idx) => `${4 + idx * 2} 0 R`).join(' ');
+  const objects: string[] = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    `2 0 obj\n<< /Type /Pages /Kids [${kidsRefs}] /Count ${pageStreams.length} >>\nendobj\n`,
+    '3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+  ];
+
+  pageStreams.forEach((streamContent, idx) => {
+    const pageObjNum = 4 + idx * 2;
+    const contentObjNum = pageObjNum + 1;
+    objects.push(
+      `${pageObjNum} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentObjNum} 0 R >>\nendobj\n`,
+    );
+    objects.push(
+      `${contentObjNum} 0 obj\n<< /Length ${streamContent.length} >>\nstream\n${streamContent}\nendstream\nendobj\n`,
+    );
+  });
+
+  let pdf = '%PDF-1.4\n';
+  const offsets: number[] = [0];
+  for (const obj of objects) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += '0000000000 65535 f \n';
+  for (let i = 1; i <= objects.length; i += 1) {
+    pdf += `${offsets[i].toString().padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF\n`;
+
+  return new File([new TextEncoder().encode(pdf)], name, { type: 'application/pdf' });
+}
+
 describe('Conversor de Extratos + Agente de I.A. Evolutivo', () => {
   it('normaliza formatos monetários brasileiros com D/C, (+)/(-), sinal posterior e parênteses', () => {
     expect(parseMonetaryValue('1.520,40 C')?.value).toBe(1520.4);
@@ -342,5 +396,102 @@ OFXHEADER:100
       expect(csvOut).toContain('125.430,85');
       expect(csvOut).toContain('980,40');
     }
+  });
+
+  it('ignora integralmente o quadro de Composição de Saldo (A-J), Posição em Data, Limites e Lançamentos Futuros do Santander', async () => {
+    const santanderPdf = buildMultiPagePositionedPdfFile('santander-empresarial-out-2026.pdf', [
+      // Página 1: Movimentação real + Lançamentos Futuros + início do quadro de Composição do Saldo
+      (text) => {
+        text('BANCO SANTANDER (BRASIL) S.A. - EXTRATO CONTA CORRENTE PJ', 40, 36);
+        text('Periodo: 01/10/2026 a 19/10/2026', 40, 52);
+        text('Data', 40, 76);
+        text('Historico', 95, 76);
+        text('Docto.', 315, 76);
+        text('Valor (R$)', 415, 76);
+        text('Saldo (R$)', 510, 76);
+
+        text('01/10/2026', 40, 96);
+        text('SALDO ANTERIOR', 95, 96);
+        text('10.000,00', 510, 96);
+
+        text('19/10/2026', 40, 114);
+        text('PIX ENVIADO FORNECEDOR METALURGICA', 95, 114);
+        text('984512', 315, 114);
+        text('-1.072,19', 415, 114);
+
+        // Segunda linha do mesmo dia sem repetir a data + cobrança real de IOF
+        text('IOF', 95, 132);
+        text('000119', 315, 132);
+        text('-14,22', 415, 132);
+        text('8.913,59', 510, 132);
+
+        // Quadro de Lançamentos Futuros (NÃO deve entrar nos lançamentos realizados)
+        text('Lancamentos Futuros', 40, 172);
+        text('25/10/2026', 40, 190);
+        text('DEBITO AUTOMATICO ENERGIA', 95, 190);
+        text('-650,00', 415, 190);
+
+        // Quadro exato de Composição do Saldo do Santander Empresarial (print enviado pelo usuário)
+        text('Saldo', 40, 228);
+        text('Posicao em: 19/10/2026', 40, 246);
+        text('Entenda a composicao do seu saldo no quadro abaixo.', 310, 260);
+        text('A - Saldo de Conta Corrente', 60, 278);
+        text('8.913,59', 510, 278);
+        text('B - Saldo Bloqueado', 60, 296);
+        text('0,00', 510, 296);
+        text('Desbloqueio em 1 dia', 95, 314);
+        text('0,00', 510, 314);
+        text('Desbloqueio em 2 dias', 95, 332);
+        text('0,00', 510, 332);
+        text('Desbloqueio em mais de 2 dias', 95, 350);
+        text('0,00', 510, 350);
+        text('C - Provisao de Encargos', 60, 368);
+        text('-72,86', 510, 368);
+        text('Juros acumulados ate a data', 95, 386);
+        text('0,00', 510, 386);
+        text('IOF Acumulado ate a data', 95, 404);
+        text('72,86', 510, 404);
+      },
+      // Página 2: Continuação do quadro de Composição do Saldo D..J sem repetir título "Saldo"
+      (text) => {
+        text('D - Provisao de Seguro Cheque Empresa Protegido', 60, 60);
+        text('0,00', 510, 60);
+        text('E - Saldo disponivel de Conta Corrente (A-B)', 60, 78);
+        text('8.913,59', 510, 78);
+        text('F - Saldo de Investimentos com Resgate Automatico', 60, 96);
+        text('15.317,25', 510, 96);
+        text('G - Saldo disponivel de Conta Corrente + Saldo de investimentos (E+F)', 60, 114);
+        text('24.230,84', 510, 114);
+        text('H - Limite Cheque Empresa', 60, 132);
+        text('90.000,00', 510, 132);
+        text('I - Limite Cheque Investidor', 60, 150);
+        text('0,00', 510, 150);
+        text('J - Saldo Disponivel + Limite (G + H + I)', 60, 168);
+        text('114.230,84', 510, 168);
+      },
+    ]);
+
+    const result = await parseUnifiedStatement(santanderPdf);
+    expect(result.bankName).toBe('Santander');
+    expect(result.openingBalance).toBe(10000);
+    // Deve extrair ESTRITAMENTE os 2 lançamentos reais e NENHUMA linha de Saldo/Posição/Provisão/Limite/Futuros!
+    expect(result.transactions).toHaveLength(2);
+    expect(result.transactions[0]).toMatchObject({
+      date: '2026-10-19',
+      document: '984512',
+      history: 'PIX ENVIADO FORNECEDOR METALURGICA',
+      amount: -1072.19,
+    });
+    expect(result.transactions[1]).toMatchObject({
+      date: '2026-10-19',
+      document: '000119',
+      history: 'IOF',
+      amount: -14.22,
+      balance: 8913.59,
+    });
+
+    const rec = computeReconciliation(result.transactions, result.openingBalance);
+    expect(rec.divergentDaysCount).toBe(0);
+    expect(rec.calculatedClosingBalance).toBe(8913.59);
   });
 });

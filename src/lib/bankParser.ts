@@ -72,6 +72,7 @@ type DateColumn = {
 
 type ColumnHints = {
   dates: DateColumn[];
+  docX?: number;
   amountX?: number;
   debitX?: number;
   creditX?: number;
@@ -84,19 +85,37 @@ type StatementPeriod = {
   yearByMonth: Map<number, number>;
 };
 
+type SectionParserState = {
+  inExcludedSection: boolean;
+  activeDate: string | null;
+};
+
 const PT_MONTHS: Record<string, number> = {
-  jan: 1, janeiro: 1,
-  fev: 2, fevereiro: 2,
-  mar: 3, marco: 3, março: 3,
-  abr: 4, abril: 4,
-  mai: 5, maio: 5,
-  jun: 6, junho: 6,
-  jul: 7, julho: 7,
-  ago: 8, agosto: 8,
-  set: 9, setembro: 9,
-  out: 10, outubro: 10,
-  nov: 11, novembro: 11,
-  dez: 12, dezembro: 12,
+  jan: 1,
+  janeiro: 1,
+  fev: 2,
+  fevereiro: 2,
+  mar: 3,
+  marco: 3,
+  março: 3,
+  abr: 4,
+  abril: 4,
+  mai: 5,
+  maio: 5,
+  jun: 6,
+  junho: 6,
+  jul: 7,
+  julho: 7,
+  ago: 8,
+  agosto: 8,
+  set: 9,
+  setembro: 9,
+  out: 10,
+  outubro: 10,
+  nov: 11,
+  novembro: 11,
+  dez: 12,
+  dezembro: 12,
 };
 
 const FULL_DATE_PATTERN = /(?<!\d)(\d{2}[/.\-]\d{2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{2}[/.\-]\d{2})(?!\d)/g;
@@ -109,16 +128,68 @@ const MONEY_PATTERN =
   /(?<![\d.,A-Za-z])(?:[+]|[-−–]\s*)?(?:R\$|BRL|\$)?\s*\(?\s*(?:\d{1,3}(?:[.\s]\d{3})+,\d{2}|\d{1,3}(?:,\d{3})+\.\d{2}|\d+[,\.]\d{2})\s*\)?(?:[-−–]|\s*\([+-]\)|\s*(?:CR|DR|C|D)(?![A-Za-z]))?(?![\d.,])/gi;
 
 const HEADER_PATTERN =
-  /(data\s*(?:de)?|lan[çc]amento|movimento|documento|hist[oó]rico|descri[çc][aã]o|valor(?:\s*\(.*\))?|saldo|extrato|ag[eê]ncia|conta(?:\s*corrente)?|cnpj|cpf|emitido\s*em|p[aá]gina|per[ií]odo|lan[çc]amentos\s+de|nome\s+do\s+cliente|banco\s+do\s+brasil|caixa\s+econ[oô]mica|ita[uú]\s+unibanco|bradesco|santander|nubank|nu\s+pagamentos)/i;
+  /(data\s*(?:de)?|lan[çc]amento|movimento|documento|docto\.?|hist[oó]rico|descri[çc][aã]o|valor(?:\s*\(.*\))?|saldo|extrato|ag[eê]ncia|conta(?:\s*corrente)?|cnpj|cpf|emitido\s*em|p[aá]gina|per[ií]odo|lan[çc]amentos\s+de|nome\s+do\s+cliente|banco\s+do\s+brasil|caixa\s+econ[oô]mica|ita[uú]\s+unibanco|bradesco|santander|nubank|nu\s+pagamentos)/i;
 
 const FOOTER_PATTERN =
-  /^(?:p[aá]g(?:ina)?\.?\s*\d+(?:\s*(?:de|\/)\s*\d+)?|sac\s+|ouvidoria|central\s+de\s+atendimento|autentica[çc][aã]o\s+digital|os\s+dados\s+acima\s+t[eê]m\s+como\s+base)/i;
+  /^(?:p[aá]g(?:ina)?\.?\s*\d+(?:\s*(?:de|\/)\s*\d+)?|sac\s+|ouvidoria|central\s+de\s+atendimento|atendimento\s+empresarial|autentica[çc][aã]o\s+(?:digital|banc[aá]ria|eletr[oô]nica)|os\s+dados\s+acima\s+t[eê]m\s+como\s+base|este\s+documento\s+[eé]\s+para\s+simples\s+confer[eê]ncia)/i;
+
+/**
+ * Headings that immediately terminate reading of the realized transactions table
+ * (balance composition boxes, position summaries, limits, future/scheduled entries, fee packages).
+ */
+const SECTION_STOP_PATTERN = new RegExp(
+  [
+    '^(?:saldos?|resumo)$',
+    '^resumo\\s+(?:financeiro|do\\s+per[ií]odo|do\\s+m[eê]s|da\\s+conta|de\\s+movimenta[çc][aã]o|consolidado)\\b',
+    '^composi[çc][aã]o\\s+(?:do\\s+|de\\s+)?saldos?\\b',
+    '^demonstrativo\\s+(?:de\\s+saldos?|de\\s+encargos|de\\s+utiliza[çc][aã]o|financeiro|de\\s+pacote)\\b',
+    '^quadro\\s+(?:de\\s+saldos?|resumo|de\\s+limites?|demonstrativo)\\b',
+    '^posi[çc][aã]o\\s+(?:em\\s*:?\\s*\\d{2}[/.\\-]\\d{2}[/.\\-]\\d{2,4}|consolidada|de\\s+saldos?|atual)\\b',
+    'entenda\\s+a\\s+composi[çc][aã]o\\s+do\\s+(?:seu\\s+)?saldo',
+    '^lan[çc]amentos?\\s+(?:futuros?|agendados?|provisionados?|a\\s+vencer|pendentes?)\\b',
+    '^movimenta[çc][oõ]es?\\s+futuras?\\b',
+    '^(?:agendamentos?|d[eé]bitos?\\s+agendados?)\\b',
+    '^valores?\\s+(?:bloqueados?|a\\s+liberar)\\b',
+    '^extrato\\s+de\\s+(?:investimentos?|aplica[çc][oõ]es?)\\b',
+    '^(?:limites?\\s+de\\s+cr[eé]dito|pacote\\s+de\\s+servi[çc]os|encargos\\s+financeiros|custo\\s+efetivo\\s+total|informa[çc][oõ]es?\\s+(?:adicionais|importantes|ao\\s+cliente)|notas?\\s+explicativas?)\\b',
+  ].join('|'),
+  'i',
+);
+
+/**
+ * Summary / balance-composition / limit / accrual rows that are NEVER accounting journal entries
+ * even if encountered outside a detected section header.
+ */
+const SUMMARY_OR_NON_TX_LINE_PATTERN = new RegExp(
+  [
+    // Lettered balance composition schedule rows: "A – Saldo de Conta Corrente", "C – Provisão...", "H – Limite...", "J - Saldo..."
+    '^[A-Z]\\s*[-\\u00AD\\u2010-\\u2015\\u2212.)]+\\s+(?:saldo|provis[aã]o|limite|juros|iof|encargos|aplic|invest|total|cr[eé]dito|d[eé]bito|cheque|desbloqueio)',
+    // Algebraic formula references at end of composition lines: "(A-B)", "(E+F)", "(G + H + I)"
+    '\\([A-Z](?:\\s*[+-]\\s*[A-Z])+\\)(?:\\s+[R$BRL0-9.,()+-\\u2013\\u2212]+)?$',
+    // Unblocking schedule breakdown rows: "Desbloqueio em 1 dia", "Desbloqueio em mais de 2 dias"
+    '^desbloqueio\\s+em\\s+(?:mais\\s+de\\s+)?\\d+\\s+dias?\\b',
+    // Provisions & accrued-to-date informational rows (distinct from real dated IOF/Juros charges)
+    '\\bprovis[aã]o\\s+de\\s+(?:encargos|juros|iof|seguro|tarifas?)\\b',
+    '\\b(?:juros|iof|encargos|rendimentos?)\\s+acumulados?\\s+at[eé]\\s+a\\s+data\\b',
+    // Credit / overdraft limit rows: "Limite Cheque Empresa", "Limite Disponível", "Limite Utilizado"
+    '^(?:[A-Z]\\s*[-\\u00AD\\u2010-\\u2015\\u2212.)]+\\s*)?limite\\s+(?:cheque|especial|dispon[ií]vel|utilizado|contratado|de\\s+cr[eé]dito|total|empresa|investidor|rotativo|pr[eé][- ]?aprovado)\\b',
+    // Balance summary rows (all variants across Santander, Itaú, Bradesco, BB, Caixa, Sicredi, Inter, Nubank)
+    '^(?:[A-Z]\\s*[-\\u00AD\\u2010-\\u2015\\u2212.)]+\\s*)?saldo\\s+(?:anterior|inicial|final|atual|do\\s+dia|parcial|total|consolidado|l[ií]quido|em\\s+conta|de\\s+conta(?:\\s+corrente)?|dispon[ií]vel|bloqueado|provis[oó]rio|vinculado|de\\s+investimentos?|de\\s+aplica[çc][oõ]es?|aplicado|investido)\\b',
+    '^s\\s*a\\s*l\\s*d\\s*o(?:\\s+(?:anterior|do\\s+dia|final|atual|dispon[ií]vel))?\\b',
+    // Period / section totals
+    '^total\\s+(?:de\\s+)?(?:cr[eé]ditos?|d[eé]bitos?|entradas?|sa[ií]das?|movimenta[çc][oõ]es?|lan[çc]amentos?|do\\s+m[eê]s|do\\s+per[ií]odo|geral|dispon[ií]vel)\\b',
+    // Position / composition captions
+    '^posi[çc][aã]o\\s+em\\s*:',
+    'entenda\\s+a\\s+composi[çc][aã]o\\s+do\\s+(?:seu\\s+)?saldo',
+  ].join('|'),
+  'i',
+);
 
 const CREDIT_PATTERN =
-  /\b(?:estorno|cr[eé]d(?:ito)?|pix\s+receb(?:ido)?|transf(?:er[eê]ncia)?\s+receb(?:ida)?|ted\s+receb(?:ida)?|doc\s+receb(?:ido)?|dep[oó]sito|desbloq|resgate|rendimento|recebimento|remunera[çc][aã]o|reembolso|devolu[çc][aã]o)\b/i;
+  /\b(?:estorno|cr[eé]d(?:ito)?|pix\s+receb(?:ido)?|transf(?:er[eê]ncia)?\s+receb(?:ida)?|ted\s+receb(?:ida)?|doc\s+receb(?:ido)?|dep[oó]sito|desbloq(?:ueio\s+judicial|\s+valor)?|resgate|rendimento|recebimento|remunera[çc][aã]o|reembolso|devolu[çc][aã]o|liq(?:uida[çc][aã]o)?\s+cobran[çc]a)\b/i;
 
 const DEBIT_PATTERN =
-  /\b(?:deb(?:ito)?|d[eé]b(?:ito)?|pix\s+enviado|transf(?:er[eê]ncia)?\s+enviada|ted\s+enviada|doc\s+enviado|saque|pag(?:amento|to)|boleto|cobranc|tarifa|tar\s+|iof|juros|encargo|compra|darf|das\b|fgts|gps\b|inss|aplica[çc][aã]o)\b/i;
+  /\b(?:deb(?:ito)?|d[eé]b(?:ito)?|pix\s+enviado|transf(?:er[eê]ncia)?\s+enviada|ted\s+enviada|doc\s+enviado|saque|pag(?:amento|to)|boleto|tarifa|tar\s+|iof\b|juros\b|encargo|compra|darf|das\b|fgts|gps\b|inss|aplica[çc][aã]o|sispag|folha\s+pag)\b/i;
 
 const OPENING_BALANCE_PATTERN =
   /\b(?:saldo\s+(?:anterior|inicial)|s\s*a\s*l\s*d\s*o\s+anterior)\b/i;
@@ -239,21 +310,69 @@ function readShortOrWrittenDate(text: string, period: StatementPeriod): string |
   return null;
 }
 
+function isSectionStopLine(text: string): boolean {
+  const trimmed = normalizeSpaces(text);
+  if (!trimmed) return false;
+  return SECTION_STOP_PATTERN.test(trimmed);
+}
+
+/**
+ * Recognizes an explicit transaction table header (e.g. "Data | Histórico | Docto. | Valor (R$) | Saldo (R$)")
+ * which cleanly (re-)opens transaction reading on a new page or new account block.
+ */
+function isTransactionTableHeader(line: PdfLine): boolean {
+  const t = line.text;
+  if (moneyTokens(t).length > 0 || getDateMatches(t).length > 0) return false;
+  const hasDateCol = /\bdata(?:\s+mov\.?|\s+de\s+lan[çc]amento|\s+de\s+movimento)?\b/i.test(t);
+  const hasDescCol = /\b(?:hist[oó]rico|descri[çc][aã]o|lan[çc]amentos?|movimenta[çc][aã]o)\b/i.test(t);
+  const hasValCol = /\b(?:valor|d[eé]bitos?|cr[eé]ditos?|sa[ií]das?|entradas?)\b/i.test(t);
+  return hasDateCol && (hasDescCol || hasValCol);
+}
+
+/**
+ * Pre-filters pages through the Section State Machine so summary boxes (`Saldo / Posição em / Limites / Futuros`)
+ * never pollute period year inference, numeric column X-clustering, or opening balance detection.
+ */
+function filterActiveStatementLinesPerPage(allPagesLines: PdfLine[][]): PdfLine[][] {
+  let excluded = false;
+  return allPagesLines.map((pageLines) => {
+    const kept: PdfLine[] = [];
+    for (const line of pageLines) {
+      if (isTransactionTableHeader(line)) {
+        excluded = false;
+        kept.push(line);
+        continue;
+      }
+      if (isSectionStopLine(line.text)) {
+        excluded = true;
+        continue;
+      }
+      if (excluded) continue;
+      if (SUMMARY_OR_NON_TX_LINE_PATTERN.test(line.text.trim()) && !OPENING_BALANCE_PATTERN.test(line.text)) {
+        continue;
+      }
+      kept.push(line);
+    }
+    return kept;
+  });
+}
+
 function inferStatementPeriod(allPagesLines: PdfLine[][]): StatementPeriod {
   const yearCounts = new Map<number, number>();
   const yearByMonth = new Map<number, number>();
 
   for (const lines of allPagesLines) {
     for (const line of lines.slice(0, 30)) {
-      const isEmissionLine = /\bemitido\s+em\b|\bdata\s+da\s+emiss[aã]o\b/i.test(line.text);
-      const weight = isEmissionLine ? 1 : 4;
+      const isEmissionOrPosLine =
+        /\bemitido\s+em\b|\bdata\s+da\s+emiss[aã]o\b|\bposi[çc][aã]o\s+em\b/i.test(line.text);
+      const weight = isEmissionOrPosLine ? 1 : 4;
 
       for (const match of line.text.matchAll(FULL_DATE_PATTERN)) {
         const iso = readDate(match[1]);
         if (!iso) continue;
         const [y, m] = iso.split('-').map(Number);
         yearCounts.set(y, (yearCounts.get(y) ?? 0) + weight);
-        if (!isEmissionLine) yearByMonth.set(m, y);
+        if (!isEmissionOrPosLine) yearByMonth.set(m, y);
       }
 
       const monthYearMatch = line.text.match(
@@ -282,11 +401,11 @@ function inferStatementPeriod(allPagesLines: PdfLine[][]): StatementPeriod {
   return { defaultYear, yearByMonth };
 }
 
-function detectDateAndSignStyles(allPagesLines: PdfLine[][]): {
+function detectDateAndSignStyles(activePagesLines: PdfLine[][]): {
   dateStyle: LearnedLayoutModel['dateStyle'];
   signStyle: LearnedLayoutModel['signStyle'];
 } {
-  const sampleText = allPagesLines
+  const sampleText = activePagesLines
     .flatMap((page) => page.map((l) => l.text))
     .slice(0, 180)
     .join('\n');
@@ -310,13 +429,14 @@ function detectDateAndSignStyles(allPagesLines: PdfLine[][]): {
 }
 
 /**
- * Unsupervised 1D X-coordinate clustering of monetary columns when explicit headers are missing or custom.
+ * Unsupervised 1D X-coordinate clustering of monetary columns exclusively within active transaction lines.
  */
-function discoverNumericColumnClusters(allPagesLines: PdfLine[][]): LearnedColumns {
+function discoverNumericColumnClusters(activePagesLines: PdfLine[][]): LearnedColumns {
   const xs: number[] = [];
-  for (const lines of allPagesLines) {
+  for (const lines of activePagesLines) {
     for (const line of lines) {
       if (OPENING_BALANCE_PATTERN.test(line.text)) continue;
+      if (SUMMARY_OR_NON_TX_LINE_PATTERN.test(line.text.trim())) continue;
       for (const chunk of line.chunks) {
         if (chunk.x > 160 && parseMonetaryValue(chunk.text)) {
           xs.push(chunk.x);
@@ -329,7 +449,7 @@ function discoverNumericColumnClusters(allPagesLines: PdfLine[][]): LearnedColum
   const sorted = [...xs].sort((a, b) => a - b);
   const clusters: Array<{ center: number; values: number[] }> = [];
   for (const x of sorted) {
-    const hit = clusters.find((c) => Math.abs(c.center - x) <= 38);
+    const hit = clusters.find((c) => Math.abs(c.center - x) <= 36);
     if (hit) {
       hit.values.push(x);
       hit.center = hit.values.reduce((s, v) => s + v, 0) / hit.values.length;
@@ -375,9 +495,12 @@ function getDateMatches(text: string): Array<{ raw: string; index: number; date:
 
 function dateCandidatesAtPosition(line: PdfLine, period: StatementPeriod): Array<{ date: string; x: number }> {
   const candidates = line.chunks.flatMap((chunk) => {
+    // Only treat a date token in the left/date columns (x < 175) as a row date, avoiding dates inside free-text descriptions when X coordinates are available
     const match = Array.from(chunk.text.matchAll(FULL_DATE_PATTERN))[0];
     const date = match?.[1] ? readDate(match[1]) : null;
-    if (date) return [{ date, x: chunk.x }];
+    if (date && (chunk.x < 175 || line.chunks.length === 1)) {
+      return [{ date, x: chunk.x }];
+    }
     if (chunk.x < 135) {
       const shortDate = readShortOrWrittenDate(chunk.text, period);
       if (shortDate) return [{ date: shortDate, x: chunk.x }];
@@ -386,11 +509,12 @@ function dateCandidatesAtPosition(line: PdfLine, period: StatementPeriod): Array
   });
   if (candidates.length > 0) return candidates;
 
-  const fullMatches = getDateMatches(line.text).map((match, index) => ({
-    date: match.date,
-    x: index * 100,
-  }));
-  if (fullMatches.length > 0) return fullMatches;
+  // Fallback when chunks were merged into one line (e.g. OCR)
+  const leadingFull = line.text.trim().match(/^(\d{2}[/.\-]\d{2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{2}[/.\-]\d{2})(?=\s|$)/);
+  if (leadingFull) {
+    const iso = readDate(leadingFull[1]);
+    if (iso) return [{ date: iso, x: 0 }];
+  }
 
   const shortLeading = readShortOrWrittenDate(line.text, period);
   return shortLeading ? [{ date: shortLeading, x: 0 }] : [];
@@ -559,22 +683,27 @@ async function readPageWithOcr(
 function inferColumns(lines: PdfLine[], learned?: LearnedColumns, swapDebitCredit = false): ColumnHints {
   const dates: DateColumn[] = [];
   const labels: Array<{ x: number; label: string }> = [];
+  let docX: number | undefined;
   let amountX = learned?.amountX;
   let debitX = learned?.debitX;
   let creditX = learned?.creditX;
   let balanceX = learned?.balanceX;
 
-  for (const line of lines.slice(0, 22)) {
+  for (const line of lines.slice(0, 26)) {
+    if (moneyTokens(line.text).length > 0) continue;
     for (const chunk of line.chunks) {
       const label = chunk.text.toLocaleLowerCase('pt-BR').trim();
       if (
-        /^data(?:\s+de)?$/i.test(chunk.text) ||
+        /^data(?:\s+de)?(?:\s+mov\.?)?$/i.test(chunk.text.trim()) ||
         /data\s+(?:de\s+)?(?:lan[çc]|movimento|vencimento|transa)/i.test(chunk.text)
       ) {
         dates.push({ x: chunk.x, label });
       }
       if (/(lan[çc]amento|movimento|compet[eê]ncia|efetiva[çc]|vencimento|transa[çc])/i.test(label)) {
         labels.push({ x: chunk.x, label });
+      }
+      if (/^(?:n[ºo°r.]*\s*)?doc(?:to|umento)?\.?$/i.test(label)) {
+        docX = chunk.x;
       }
       if (/^valor(?:\s*\(.*\))?$/i.test(label)) amountX = chunk.x;
       if (/^(?:d[eé]bito|sa[ií]da)s?(?:\s*\(.*\))?$/i.test(label)) debitX = chunk.x;
@@ -597,6 +726,7 @@ function inferColumns(lines: PdfLine[], learned?: LearnedColumns, swapDebitCredi
 
   return {
     dates: enrichedDates,
+    docX,
     amountX,
     debitX,
     creditX,
@@ -628,6 +758,7 @@ function selectedDate(line: PdfLine, hints: ColumnHints, period: StatementPeriod
 
 function extractOpeningBalanceFromLines(lines: PdfLine[]): number | null {
   for (const line of lines) {
+    if (isSectionStopLine(line.text)) break;
     if (OPENING_BALANCE_PATTERN.test(line.text)) {
       const vals = moneyTokens(line.text);
       if (vals.length > 0) {
@@ -644,17 +775,40 @@ function isIgnoredByLearnedModel(text: string, ignoredPatterns: string[]): boole
   return ignoredPatterns.some((pat) => pat.length >= 3 && upper.includes(pat.toUpperCase()));
 }
 
+/**
+ * Checks if a single-value line actually placed its ONLY number inside the `Saldo` column
+ * while leaving `Valor / Débito / Crédito` completely blank (e.g. balance-only rows & summary tables).
+ */
+function hasOnlyBalanceColumnValue(
+  positionedValues: Array<ValueToken & { x: number }>,
+  hints: ColumnHints,
+): boolean {
+  if (positionedValues.length !== 1 || hints.balanceX === undefined) return false;
+  const txCols = [hints.amountX, hints.debitX, hints.creditX].filter(
+    (x): x is number => x !== undefined,
+  );
+  if (txCols.length === 0) return false;
+
+  const onlyVal = positionedValues[0];
+  const distToBalance = Math.abs(onlyVal.x - hints.balanceX);
+  const nearestTxColDist = Math.min(...txCols.map((colX) => Math.abs(onlyVal.x - colX)));
+
+  // If `Saldo` column is clearly distinct from `Valor` column and the single number sits on `Saldo`:
+  return distToBalance <= 34 && nearestTxColDist >= distToBalance + 28;
+}
+
 function isNoise(line: PdfLine, ignoredPatterns: string[] = []): boolean {
-  const value = line.text;
+  const value = line.text.trim();
   if (!value || FOOTER_PATTERN.test(value)) return true;
   if (isIgnoredByLearnedModel(value, ignoredPatterns)) return true;
-  if (/about:blank|^(?:p[aá]gina|page)\s*\d+(?:\s*(?:de|of|\/)\s*\d+)?$/i.test(value.trim())) {
+  if (SUMMARY_OR_NON_TX_LINE_PATTERN.test(value)) return true;
+  if (/about:blank|^(?:p[aá]gina|page)\s*\d+(?:\s*(?:de|of|\/)\s*\d+)?$/i.test(value)) {
     return true;
   }
   const noDates = getDateMatches(value).length === 0;
   const noMoney = moneyTokens(value).length === 0;
   if (noDates && noMoney && HEADER_PATTERN.test(value)) return true;
-  return /(?:lan[çc]amentos\s+de|extrato\s+(?:banc[aá]rio|da\s+conta|mensal|por\s+per[ií]odo)?|emitido\s+em|saldo\s+(?:inicial|anterior|final|bloqueado|dispon[ií]vel|total)|s\s*a\s*l\s*d\s*o|per[ií]odo\s+(?:de|da|:))/i.test(
+  return /(?:lan[çc]amentos\s+de|extrato\s+(?:banc[aá]rio|da\s+conta|mensal|por\s+per[ií]odo|conta\s+corrente)|emitido\s+em|per[ií]odo\s*(?:de|da|:))/i.test(
     value,
   );
 }
@@ -665,11 +819,15 @@ function isEffectiveDateLine(text: string): boolean {
 
 function lineHasDate(line: PdfLine, period: StatementPeriod): boolean {
   if (isEffectiveDateLine(line.text)) return false;
-  return getDateMatches(line.text).length > 0 || readShortOrWrittenDate(line.text, period) !== null;
+  return dateCandidatesAtPosition(line, period).length > 0;
 }
 
-function looksLikeStart(line: PdfLine, period: StatementPeriod): boolean {
-  return lineHasDate(line, period) && moneyTokens(line.text).length > 0;
+function looksLikeStart(line: PdfLine, period: StatementPeriod, hints: ColumnHints): boolean {
+  if (!lineHasDate(line, period)) return false;
+  const vals = valuesAtPosition([line]);
+  if (vals.length === 0 && moneyTokens(line.text).length === 0) return false;
+  if (hasOnlyBalanceColumnValue(vals, hints)) return false;
+  return true;
 }
 
 function isDateAnchor(line: PdfLine, period: StatementPeriod): boolean {
@@ -685,15 +843,17 @@ function isTrackingCode(text: string): boolean {
   return compact.length >= 18 && /[A-Za-z]/.test(compact) && /\d/.test(compact) && !/\s/.test(text.trim());
 }
 
-function nearestValue(
+function nearestValueWithin(
   values: Array<ValueToken & { x: number }>,
   x: number | undefined,
+  maxDistance = 52,
 ): (ValueToken & { x: number }) | undefined {
   if (x === undefined || values.length === 0) return undefined;
-  return values.reduce<(ValueToken & { x: number }) | undefined>((selected, value) => {
+  const best = values.reduce<(ValueToken & { x: number }) | undefined>((selected, value) => {
     if (!selected || Math.abs(value.x - x) < Math.abs(selected.x - x)) return value;
     return selected;
   }, undefined);
+  return best && Math.abs(best.x - x) <= maxDistance ? best : undefined;
 }
 
 function stripLeadingDates(text: string): string {
@@ -703,7 +863,7 @@ function stripLeadingDates(text: string): string {
     .replace(SHORT_DATE_LEADING_PATTERN, ' ');
 }
 
-function structuredDescription(
+function extractLineDescriptionAndDoc(
   line: PdfLine,
   hints: ColumnHints,
 ): { description: string; document: string } {
@@ -712,23 +872,65 @@ function structuredDescription(
     hints.creditX ?? Number.POSITIVE_INFINITY,
     hints.amountX ?? Number.POSITIVE_INFINITY,
   );
-  const cutoffX = Number.isFinite(firstMoneyCol) ? firstMoneyCol : undefined;
-  const visible = line.chunks
-    .filter((chunk) => cutoffX === undefined || chunk.x < cutoffX - 20)
-    .map((chunk) => chunk.text)
-    .join(' ');
-  const cleaned = stripLeadingDates(visible);
-  const beforeValue = normalizeSpaces(cleaned);
+
+  // If chunk X positions and money column X exist, separate chunks cleanly by geometry!
+  if (Number.isFinite(firstMoneyCol) && line.chunks.length > 1) {
+    let extractedDoc = '';
+    const descChunks: string[] = [];
+
+    for (const chunk of line.chunks) {
+      if (chunk.x >= firstMoneyCol - 22 && parseMonetaryValue(chunk.text)) {
+        continue;
+      }
+      if (
+        hints.docX !== undefined &&
+        Math.abs(chunk.x - hints.docX) <= 28 &&
+        /^[\d./-]{1,20}$/.test(chunk.text.trim()) &&
+        !readDate(chunk.text.trim())
+      ) {
+        if (!extractedDoc) extractedDoc = chunk.text.trim();
+        continue;
+      }
+      descChunks.push(chunk.text);
+    }
+
+    let cleaned = normalizeSpaces(stripLeadingDates(descChunks.join(' ')));
+    if (WRITTEN_DATE_LINE_PATTERN.test(cleaned)) {
+      return { description: '', document: extractedDoc };
+    }
+
+    if (!extractedDoc) {
+      const leadDoc = cleaned.match(/^(?:(?:doc(?:to|umento)?\.?\s*[:#-]?\s*)?)(\d{1,20})(?=\s|$)/i);
+      if (leadDoc) {
+        extractedDoc = leadDoc[1];
+        cleaned = normalizeSpaces(cleaned.slice(leadDoc[0].length));
+      } else if (hints.docX !== undefined) {
+        const trailDoc = cleaned.match(/\s+(\d{4,14})$/);
+        if (trailDoc) {
+          extractedDoc = trailDoc[1];
+          cleaned = normalizeSpaces(cleaned.slice(0, -trailDoc[0].length));
+        }
+      }
+    }
+
+    return { description: cleaned, document: extractedDoc };
+  }
+
+  // Text fallback (single-chunk / OCR)
+  const values = Array.from(line.text.matchAll(MONEY_PATTERN));
+  const cutoff = values[0]?.index ?? line.text.length;
+  let beforeValue = line.text.slice(0, cutoff);
+  beforeValue = normalizeSpaces(stripLeadingDates(beforeValue));
+
   if (WRITTEN_DATE_LINE_PATTERN.test(beforeValue)) {
     return { description: '', document: '' };
   }
-  const documentMatch = beforeValue.match(/^(?:(?:doc(?:umento)?\s*[:#-]?\s*)?)(\d{1,20})(?=\s|$)/i);
-  return {
-    description: normalizeSpaces(
-      documentMatch ? beforeValue.slice(documentMatch[0].length) : beforeValue,
-    ),
-    document: documentMatch?.[1] ?? '',
-  };
+
+  const documentMatch = beforeValue.match(/^(?:(?:doc(?:to|umento)?\.?\s*[:#-]?\s*)?)(\d{1,20})(?=\s|$)/i);
+  const document = documentMatch?.[1] ?? '';
+  if (documentMatch) beforeValue = beforeValue.slice(documentMatch[0].length);
+
+  return { description: normalizeSpaces(beforeValue), document };
 }
 
 function isPureValueFragment(line: PdfLine): boolean {
@@ -736,27 +938,11 @@ function isPureValueFragment(line: PdfLine): boolean {
   return compact.length === 0 && (moneyTokens(line.text).length > 0 || /^[-−–]$/.test(line.text.trim()));
 }
 
-function stripDateAndNumbers(line: PdfLine): { description: string; document: string } {
-  const values = Array.from(line.text.matchAll(MONEY_PATTERN));
-  const cutoff = values[0]?.index ?? line.text.length;
-  let beforeValue = line.text.slice(0, cutoff);
-  beforeValue = stripLeadingDates(beforeValue);
-  beforeValue = normalizeSpaces(beforeValue);
-
-  if (WRITTEN_DATE_LINE_PATTERN.test(beforeValue)) {
-    return { description: '', document: '' };
-  }
-
-  const documentMatch = beforeValue.match(/^(?:(?:doc(?:umento)?\s*[:#-]?\s*)?)(\d{1,20})(?=\s|$)/i);
-  const document = documentMatch?.[1] ?? '';
-  if (documentMatch) beforeValue = beforeValue.slice(documentMatch[0].length);
-
-  return { description: normalizeSpaces(beforeValue), document };
-}
-
 function hasSaldoDia(description: string): boolean {
-  return /^(?:saldo\s+(?:do\s+)?dia|saldo\s+anterior|saldo\s+inicial|saldo\s+final|s\s*a\s*l\s*d\s*o)$/i.test(
-    description.trim(),
+  return (
+    /^(?:saldo\s+(?:do\s+)?dia|saldo\s+anterior|saldo\s+inicial|saldo\s+final|s\s*a\s*l\s*d\s*o)$/i.test(
+      description.trim(),
+    ) || SUMMARY_OR_NON_TX_LINE_PATTERN.test(description.trim())
   );
 }
 
@@ -764,13 +950,13 @@ function lineDistance(first: PdfLine, second: PdfLine): number {
   return Math.abs(first.y - second.y);
 }
 
-function recordAlreadyComplete(record: WorkingRecord): boolean {
+function recordAlreadyComplete(record: WorkingRecord, hints: ColumnHints): boolean {
   const allLines = [record.line, ...record.continuations];
   const hasMoney = allLines.some((l) => moneyTokens(l.text).length > 0);
   if (!hasMoney) return false;
   const hasDesc = allLines.some((l) => {
     if (isPureValueFragment(l) || isEffectiveDateLine(l.text)) return false;
-    const { description } = stripDateAndNumbers(l);
+    const { description } = extractLineDescriptionAndDoc(l, hints);
     return description.length >= 3;
   });
   return hasDesc;
@@ -819,17 +1005,21 @@ function parseRecord(
   const allValues = [...mainValues, ...fragmentValues];
   if (allValues.length === 0) return null;
 
+  const positionedValues = valuesAtPosition(detailLines);
+  if (hasOnlyBalanceColumnValue(positionedValues, hints)) {
+    return null;
+  }
+
   let amountToken: ValueToken & { x?: number };
   let balanceToken: ValueToken | undefined;
-  const positionedValues = valuesAtPosition(detailLines);
   const splitLayout = hints.splitDateLayout || isDateAnchor(record.line, period);
   const structuredHints = splitLayout
     ? { ...hints, amountX: hints.amountX ?? 500, balanceX: hints.balanceX ?? 700 }
     : hints;
 
   const hasDualColumns = hints.debitX !== undefined && hints.creditX !== undefined;
-  const positionedAmount = nearestValue(positionedValues, structuredHints.amountX);
-  const positionedBalance = nearestValue(positionedValues, structuredHints.balanceX);
+  const positionedAmount = nearestValueWithin(positionedValues, structuredHints.amountX);
+  const positionedBalance = nearestValueWithin(positionedValues, structuredHints.balanceX);
 
   if (hasDualColumns && positionedValues.length >= 1) {
     const nonBalance = positionedValues.filter(
@@ -846,7 +1036,7 @@ function parseRecord(
         : allValues.length > 1
           ? allValues[allValues.length - 1]
           : undefined;
-  } else if (splitLayout && positionedAmount && positionedAmount !== positionedBalance) {
+  } else if (positionedAmount && positionedAmount !== positionedBalance) {
     amountToken = positionedAmount;
     balanceToken =
       positionedBalance ?? (allValues.length > 1 ? allValues[allValues.length - 1] : undefined);
@@ -858,26 +1048,33 @@ function parseRecord(
     balanceToken = allValues.length > 1 ? allValues[allValues.length - 1] : undefined;
   }
 
+  // Strictly ignore 0,00 informational status lines (Saldo Bloqueado 0,00, Limite 0,00, Juros 0,00, etc.)
+  if (amountToken.absValue < 0.005) {
+    return null;
+  }
+
   let document = '';
   const descriptions = detailLines
     .filter(
       (line) =>
         !isPureValueFragment(line) &&
         !isEffectiveDateLine(line.text) &&
-        !isTrackingCode(line.text),
+        !isTrackingCode(line.text) &&
+        !isSectionStopLine(line.text),
     )
     .map((line) => {
-      const parsed = splitLayout ? structuredDescription(line, structuredHints) : stripDateAndNumbers(line);
+      const parsed = extractLineDescriptionAndDoc(line, structuredHints);
       if (!document && parsed.document) document = parsed.document;
       return parsed.description;
     })
     .filter(
       (text) =>
         text.length > 0 &&
-        !/^(?:data(?:\s+\w+)?\s*)?(?:nr\.?\s*doc\.?|doc\.?|documento)?\s*(?:hist[oó]rico(?:\s+operacional)?|descri[çc][aã]o|lan[çc]amentos?)(?:\s+(?:valor|d[eé]bito|cr[eé]dito|saldo))?$/i.test(
+        !/^(?:data(?:\s+\w+)?\s*)?(?:nr\.?\s*doc\.?|doc(?:to)?\.?|documento)?\s*(?:hist[oó]rico(?:\s+operacional)?|descri[çc][aã]o|lan[çc]amentos?)(?:\s+(?:docto\.?|documento|valor|d[eé]bito|cr[eé]dito|saldo))?$/i.test(
           text.trim(),
         ) &&
         !FOOTER_PATTERN.test(text) &&
+        !SUMMARY_OR_NON_TX_LINE_PATTERN.test(text.trim()) &&
         !isIgnoredByLearnedModel(text, layoutModel.ignoredPatterns),
     );
 
@@ -886,7 +1083,7 @@ function parseRecord(
   if (isIgnoredByLearnedModel(joinedHistory, layoutModel.ignoredPatterns)) return null;
 
   const history = applyLearnedHistoryReplacements(joinedHistory, layoutModel);
-  if (!history) return null;
+  if (!history || hasSaldoDia(history)) return null;
 
   const upperHistory = history.toUpperCase();
   const learnedCreditHit = layoutModel.creditKeywords.some((kw) => upperHistory.includes(kw.toUpperCase()));
@@ -896,7 +1093,6 @@ function parseRecord(
   let amount: number;
   let signWasAmbiguous = false;
 
-  // Learned layout memory overrides generic ambiguity immediately!
   if (learnedCreditHit && !learnedDebitHit) {
     amount = amountToken.absValue;
   } else if (learnedDebitHit && !learnedCreditHit) {
@@ -911,9 +1107,11 @@ function parseRecord(
     amount = distDebit <= distCredit ? -amountToken.absValue : amountToken.absValue;
   } else {
     signWasAmbiguous = true;
-    if (CREDIT_PATTERN.test(history)) {
+    const isCred = CREDIT_PATTERN.test(history);
+    const isDeb = DEBIT_PATTERN.test(history);
+    if (isCred && !isDeb) {
       amount = amountToken.absValue;
-    } else if (DEBIT_PATTERN.test(history)) {
+    } else if (isDeb && !isCred) {
       amount = -amountToken.absValue;
     } else {
       amount = amountToken.value;
@@ -1001,34 +1199,43 @@ function reconcileSignsByBalance(
 function recordsFromLines(
   lines: PdfLine[],
   period: StatementPeriod,
+  hints: ColumnHints,
   ignoredPatterns: string[],
+  sectionState: SectionParserState,
 ): WorkingRecord[] {
+  const MAX_CONTINUATION_STEP_Y = 30;
+  const MAX_INHERITED_ROW_GAP_Y = 44;
+
   const records: WorkingRecord[] = [];
   let current: WorkingRecord | null = null;
-  let activeDate: string | null = null;
   let pending: PdfLine[] = [];
 
-  const flushPendingToCurrentOrNext = (next: WorkingRecord | null) => {
-    if (!current || pending.length === 0) {
+  const attachClosePendingLines = (next: WorkingRecord | null) => {
+    if (pending.length === 0) return;
+
+    if (!current) {
       if (next) {
-        next.continuations.push(...pending.filter((line) => lineDistance(line, next.line) <= 40));
+        next.continuations.push(
+          ...pending.filter((line) => lineDistance(line, next.line) <= MAX_CONTINUATION_STEP_Y),
+        );
       }
       pending = [];
       return;
     }
-    if (!next) {
-      current.continuations.push(...pending);
-      pending = [];
-      return;
-    }
-    let prevBottomY = current.line.y;
+
+    let prevBottomY =
+      current.continuations.length > 0
+        ? current.continuations[current.continuations.length - 1].y
+        : current.line.y;
+
     for (const line of pending) {
       const gapFromCurrent = Math.abs(prevBottomY - line.y);
-      const gapToNext = Math.abs(line.y - next.line.y);
-      if (gapFromCurrent <= gapToNext) {
+      const gapToNext = next ? Math.abs(line.y - next.line.y) : Number.POSITIVE_INFINITY;
+
+      if (gapFromCurrent <= MAX_CONTINUATION_STEP_Y && gapFromCurrent <= gapToNext) {
         current.continuations.push(line);
         prevBottomY = line.y;
-      } else {
+      } else if (next && gapToNext <= MAX_CONTINUATION_STEP_Y) {
         next.continuations.push(line);
       }
     }
@@ -1036,46 +1243,87 @@ function recordsFromLines(
   };
 
   for (const line of lines) {
-    if (isNoise(line, ignoredPatterns)) continue;
+    // 1. Explicit Transaction Table Header re-opens active transaction parsing
+    if (isTransactionTableHeader(line)) {
+      attachClosePendingLines(null);
+      sectionState.inExcludedSection = false;
+      current = null;
+      pending = [];
+      continue;
+    }
 
-    if (looksLikeStart(line, period)) {
+    // 2. Non-transaction section boundary ("Saldo", "Posição em: ...", "Limites", "Lançamentos Futuros", etc.)
+    if (isSectionStopLine(line.text)) {
+      attachClosePendingLines(null);
+      sectionState.inExcludedSection = true;
+      sectionState.activeDate = null;
+      current = null;
+      pending = [];
+      continue;
+    }
+
+    if (sectionState.inExcludedSection) {
+      continue;
+    }
+
+    // 3. Summary / noise filtering
+    if (isNoise(line, ignoredPatterns)) {
+      continue;
+    }
+
+    // 4. Dated transaction row start
+    if (looksLikeStart(line, period, hints)) {
       const next: WorkingRecord = { line, continuations: [] };
-      flushPendingToCurrentOrNext(next);
-      const lineDate = dateCandidatesAtPosition(line, period)[0]?.date;
-      if (lineDate) activeDate = lineDate;
+      attachClosePendingLines(next);
+      const lineDate = selectedDate(line, hints, period);
+      if (lineDate) sectionState.activeDate = lineDate;
       records.push(next);
       current = next;
       continue;
     }
 
+    // 5. Standalone date header anchor (e.g. Nubank / Inter "05 MAR 2026" on left margin)
     if (isDateAnchor(line, period)) {
-      const anchorDate = dateCandidatesAtPosition(line, period)[0]?.date;
-      if (anchorDate) activeDate = anchorDate;
-      const next: WorkingRecord = { line, continuations: [], inheritedDate: anchorDate };
-      flushPendingToCurrentOrNext(next);
+      const anchorDate = selectedDate(line, hints, period);
+      if (anchorDate) sectionState.activeDate = anchorDate;
+      const next: WorkingRecord = { line, continuations: [], inheritedDate: anchorDate ?? undefined };
+      attachClosePendingLines(next);
       records.push(next);
       current = next;
       continue;
     }
+
+    // 6. Same-day dateless transaction row inside an active date group
+    // Must have non-zero transaction value (not balance-only column), valid non-summary description,
+    // and close vertical proximity to the preceding transaction row (never across separate boxes!).
+    const lastAnchorY =
+      current && current.continuations.length > 0
+        ? current.continuations[current.continuations.length - 1].y
+        : current?.line.y;
+    const verticalGap = lastAnchorY !== undefined ? Math.abs(lastAnchorY - line.y) : 0;
 
     if (
-      activeDate &&
-      current &&
+      sectionState.activeDate &&
       moneyTokens(line.text).length > 0 &&
       !isPureValueFragment(line) &&
-      !isEffectiveDateLine(line.text)
+      !isEffectiveDateLine(line.text) &&
+      !hasOnlyBalanceColumnValue(valuesAtPosition([line]), hints) &&
+      (current === null || verticalGap <= MAX_INHERITED_ROW_GAP_Y)
     ) {
-      const { description } = stripDateAndNumbers(line);
-      if (description.length >= 3 && !HEADER_PATTERN.test(description)) {
+      const { description } = extractLineDescriptionAndDoc(line, hints);
+      if (
+        description.length >= 3 &&
+        !HEADER_PATTERN.test(description) &&
+        !SUMMARY_OR_NON_TX_LINE_PATTERN.test(description)
+      ) {
         if (pending.length > 0) {
-          current.continuations.push(...pending);
-          pending = [];
+          attachClosePendingLines(null);
         }
-        if (recordAlreadyComplete(current)) {
+        if (!current || recordAlreadyComplete(current, hints)) {
           const next: WorkingRecord = {
             line,
             continuations: [],
-            inheritedDate: activeDate,
+            inheritedDate: sectionState.activeDate,
           };
           records.push(next);
           current = next;
@@ -1084,9 +1332,17 @@ function recordsFromLines(
       }
     }
 
+    // If a large vertical break occurs without starting a transaction, close current so bottom boxes don't merge
+    if (current && verticalGap > MAX_INHERITED_ROW_GAP_Y) {
+      attachClosePendingLines(null);
+      current = null;
+      continue;
+    }
+
     pending.push(line);
   }
-  flushPendingToCurrentOrNext(null);
+
+  attachClosePendingLines(null);
   return records;
 }
 
@@ -1140,6 +1396,7 @@ export async function parseBankStatement(
     }
   }
 
+  const activePagesLines = filterActiveStatementLinesPerPage(allPagesLines);
   const headerLines = allPagesLines[0]?.slice(0, 22).map((l) => l.text) ?? [];
   const headerSample = allPagesLines
     .slice(0, 2)
@@ -1147,9 +1404,9 @@ export async function parseBankStatement(
     .join('\n');
   let bankName = detectBankName(headerSample);
   const headerTokens = normalizeHeaderTokens(headerLines);
-  const { dateStyle, signStyle } = detectDateAndSignStyles(allPagesLines);
-  const discoveredColumns = discoverNumericColumnClusters(allPagesLines);
-  const period = inferStatementPeriod(allPagesLines);
+  const { dateStyle, signStyle } = detectDateAndSignStyles(activePagesLines);
+  const discoveredColumns = discoverNumericColumnClusters(activePagesLines);
+  const period = inferStatementPeriod(activePagesLines);
 
   const matchResult = findMatchingLayoutModel(
     learnedModels,
@@ -1212,11 +1469,48 @@ export async function parseBankStatement(
     }
   }
 
+  const sectionState: SectionParserState = {
+    inExcludedSection: false,
+    activeDate: null,
+  };
+
+  const baseDocHints = inferColumns(
+    allPagesLines[0] ?? [],
+    activeModel.columns,
+    Boolean(activeModel.swapDebitCreditColumns),
+  );
+  const effectiveColumns: LearnedColumns = {
+    ...activeModel.columns,
+    amountX: baseDocHints.amountX ?? activeModel.columns.amountX,
+    debitX: baseDocHints.debitX ?? activeModel.columns.debitX,
+    creditX: baseDocHints.creditX ?? activeModel.columns.creditX,
+    balanceX: baseDocHints.balanceX ?? activeModel.columns.balanceX,
+  };
+  activeModel = {
+    ...activeModel,
+    columns: effectiveColumns,
+  };
+
   const rawParsed: RawParsedTx[] = [];
   allPagesLines.forEach((lines, idx) => {
     const pageNumber = idx + 1;
-    const hints = inferColumns(lines, activeModel.columns, Boolean(activeModel.swapDebitCreditColumns));
-    const records = recordsFromLines(lines, period, activeModel.ignoredPatterns);
+    const pageHints = inferColumns(
+      lines,
+      effectiveColumns,
+      Boolean(activeModel.swapDebitCreditColumns),
+    );
+    const hints: ColumnHints = {
+      ...pageHints,
+      dates: pageHints.dates.length > 0 ? pageHints.dates : baseDocHints.dates,
+      docX: pageHints.docX ?? baseDocHints.docX,
+    };
+    const records = recordsFromLines(
+      lines,
+      period,
+      hints,
+      activeModel.ignoredPatterns,
+      sectionState,
+    );
     const parsedPage = records
       .map((record, rIndex) =>
         parseRecord(
@@ -1239,7 +1533,7 @@ export async function parseBankStatement(
 
   // External Generative AI fallback/enhancement if configured and layout yielded 0 rows
   if (transactions.length === 0 && aiConfig?.apiKey?.trim()) {
-    const flatRaw = allPagesLines.flatMap((p) => p.map((l) => l.text));
+    const flatRaw = activePagesLines.flatMap((p) => p.map((l) => l.text));
     const llmResult = await queryExternalAiForRawLines(flatRaw, aiConfig);
     if (llmResult.bankName) bankName = llmResult.bankName;
     activeModel = {
@@ -1249,31 +1543,32 @@ export async function parseBankStatement(
       debitKeywords: [...new Set([...activeModel.debitKeywords, ...(llmResult.debitKeywords ?? [])])],
       ignoredPatterns: [...new Set([...activeModel.ignoredPatterns, ...(llmResult.ignoredPatterns ?? [])])],
     };
-    transactions = (llmResult.transactions ?? []).map((item, idx) => ({
-      id: `${sourceId}-ai-${idx}-${item.date}-${item.amount.toFixed(2)}`,
-      date: item.date,
-      document: item.document ?? '',
-      history: item.history,
-      accountCode: '',
-      amount: item.amount,
-      debit: item.amount < 0 ? Math.abs(item.amount) : 0,
-      credit: item.amount > 0 ? item.amount : 0,
-      balance: item.balance ?? null,
-      sourceId,
-      sourceFile: file.name,
-      sourceBank: bankName,
-      layoutModelId: activeModel.id,
-      sourcePage: 1,
-      confidence: 0.95,
-      warnings: [],
-    }));
+    transactions = (llmResult.transactions ?? [])
+      .filter((item) => Math.abs(item.amount) >= 0.005)
+      .map((item, idx) => ({
+        id: `${sourceId}-ai-${idx}-${item.date}-${item.amount.toFixed(2)}`,
+        date: item.date,
+        document: item.document ?? '',
+        history: item.history,
+        accountCode: '',
+        amount: item.amount,
+        debit: item.amount < 0 ? Math.abs(item.amount) : 0,
+        credit: item.amount > 0 ? item.amount : 0,
+        balance: item.balance ?? null,
+        sourceId,
+        sourceFile: file.name,
+        sourceBank: bankName,
+        layoutModelId: activeModel.id,
+        sourcePage: 1,
+        confidence: 0.95,
+        warnings: [],
+      }));
     agentNotes.push(
       `Agente de I.A. Generativa extraiu ${transactions.length} lançamento(s) e salvou padrões do layout.`,
     );
   }
 
-  // Autonomous Combinatorial Self-Correction pass:
-  // If any day has a balance discrepancy solvable to 0.00 cents, auto-fix AND teach `activeModel` immediately!
+  // Autonomous Combinatorial Self-Correction pass
   const initialRec = computeReconciliation(transactions, openingBalance);
   if (initialRec.divergentDaysCount > 0) {
     const autoFixes = diagnoseAndSolveDivergences(transactions, initialRec);
@@ -1455,13 +1750,13 @@ export async function parseOfxStatement(
 
     const amtRaw = tag('TRNAMT').replace(',', '.');
     const amount = Number(amtRaw);
-    if (!Number.isFinite(amount)) return;
+    if (!Number.isFinite(amount) || Math.abs(amount) < 0.005) return;
 
     const namePart = tag('NAME');
     const memoPart = tag('MEMO');
     const combinedHistory = normalizeHistoryParts([namePart, memoPart]);
     const history = applyLearnedHistoryReplacements(combinedHistory || 'LANÇAMENTO OFX', model);
-    if (isIgnoredByLearnedModel(history, model.ignoredPatterns)) return;
+    if (hasSaldoDia(history) || isIgnoredByLearnedModel(history, model.ignoredPatterns)) return;
 
     const document = tag('CHECKNUM') || tag('REFNUM') || tag('FITID').slice(-10);
 
@@ -1498,7 +1793,7 @@ export async function parseOfxStatement(
     bankName,
     openingBalance: null,
     closingBalance: closingBalance !== null && Number.isFinite(closingBalance) ? closingBalance : null,
-    updatedModel: { ...model, totalTransactions: (model.totalTransactions - blocks.length) + transactions.length },
+    updatedModel: { ...model, totalTransactions: model.totalTransactions - blocks.length + transactions.length },
     wasKnownModel: wasKnown,
     agentNotes: [
       wasKnown
@@ -1548,16 +1843,29 @@ function parseTabularRows(
   const findCol = (regex: RegExp) => headers.findIndex((h) => regex.test(h));
 
   const dateCol = findCol(/\bdata\b/);
-  const docCol = findCol(/^(?:doc|documento|n[ºo°]\s*doc|identificador)/);
+  const docCol = findCol(/^(?:doc|docto|documento|n[ºo°]\s*doc|identificador)/);
   const histCol = findCol(/(hist[oó]rico|descri[çc][aã]o|lan[çc]amento|detalhe|memo)/);
   const valCol = findCol(/^valor/);
   const debCol = findCol(/^(?:d[eé]bito|sa[ií]da)/);
   const credCol = findCol(/^(?:cr[eé]dito|entrada)/);
   const balCol = findCol(/^saldo/);
 
+  let openingBalance: number | null = null;
   const transactions: Transaction[] = [];
+
   for (let r = headerIdx + 1; r < rows.length; r += 1) {
     const row = rows[r];
+    const joinedLine = row.join(' ').trim();
+    if (!joinedLine) continue;
+    if (isSectionStopLine(joinedLine)) break;
+
+    const rawHistory = normalizeSpaces(histCol !== -1 ? row[histCol] ?? '' : 'LANÇAMENTO IMPORTADO');
+    if (OPENING_BALANCE_PATTERN.test(rawHistory) && balCol !== -1) {
+      const balTok = parseMonetaryValue(row[balCol] ?? '');
+      if (balTok && openingBalance === null) openingBalance = balTok.value;
+      continue;
+    }
+
     const rawDate = (row[dateCol] ?? '').trim();
     const isoDate = readDate(rawDate);
     if (!isoDate) continue;
@@ -1576,13 +1884,14 @@ function parseTabularRows(
       const valToken = parseMonetaryValue(row[valCol] ?? '');
       if (valToken) amount = valToken.value;
     }
-    if (amount === null) continue;
+    if (amount === null || Math.abs(amount) < 0.005) continue;
 
-    const rawHistory = normalizeSpaces(histCol !== -1 ? row[histCol] ?? '' : 'LANÇAMENTO IMPORTADO');
     if (!rawHistory || hasSaldoDia(rawHistory)) continue;
     if (isIgnoredByLearnedModel(rawHistory, model.ignoredPatterns)) continue;
 
     const history = applyLearnedHistoryReplacements(rawHistory, model);
+    if (!history || hasSaldoDia(history)) continue;
+
     const document = normalizeSpaces(docCol !== -1 ? row[docCol] ?? '' : '');
     const balToken = balCol !== -1 ? parseMonetaryValue(row[balCol] ?? '') : null;
 
@@ -1614,7 +1923,7 @@ function parseTabularRows(
     pages: 1,
     warnings: transactions.length === 0 ? ['Nenhuma linha válida de transação encontrada.'] : [],
     bankName,
-    openingBalance: null,
+    openingBalance,
     closingBalance,
     updatedModel: { ...model, totalTransactions: model.totalTransactions + transactions.length },
     wasKnownModel: wasKnown,
