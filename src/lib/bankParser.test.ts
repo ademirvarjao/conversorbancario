@@ -1,240 +1,307 @@
 import { describe, expect, it } from 'vitest';
-import { PDFDocument, StandardFonts } from 'pdf-lib';
-import {
-  parseBankStatement,
-  parseCsvStatement,
-  parseMonetaryValue,
-  parseOfxStatement,
-} from './bankParser';
+import { parseMonetaryValue, parseUnifiedStatement, readDate } from './bankParser';
 import { mergeWithSmartDedup } from './dedup';
+import { recordIgnoredRowInModel, recordSignCorrectionInModel } from './layoutAgent';
 import { computeReconciliation } from './reconciliation';
-import { buildCsvContent, buildOfxContent, buildWorkbook } from './exporters';
 
-async function createMockPdf(
-  name: string,
-  pages: Array<Array<{ x: number; y: number; text: string }>>,
-): Promise<File> {
-  const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-
-  for (const items of pages) {
-    const page = pdfDoc.addPage([842, 595]);
-    for (const item of items) {
-      page.drawText(item.text, {
-        x: item.x,
-        y: item.y,
-        size: 10,
-        font,
-      });
-    }
-  }
-
-  const bytes = await pdfDoc.save();
-  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-  return {
-    name,
-    type: 'application/pdf',
-    size: bytes.byteLength,
-    lastModified: Date.now(),
-    arrayBuffer: async () => ab,
-  } as unknown as File;
+interface PdfTextOp {
+  text: string;
+  x: number;
+  y: number;
 }
 
-describe('parseMonetaryValue', () => {
-  it('parses Caixa D/C, Banco do Brasil (-)/(+), Itaú trailing minus, and BRL values accurately', () => {
-    expect(parseMonetaryValue('12.555,84 D')?.value).toBe(-12555.84);
-    expect(parseMonetaryValue('13.421,68 C')?.value).toBe(13421.68);
-    expect(parseMonetaryValue('1.250,00 (-)')?.value).toBe(-1250.00);
-    expect(parseMonetaryValue('3.400,50 (+)')?.value).toBe(3400.50);
-    expect(parseMonetaryValue('890,25-')?.value).toBe(-890.25);
-    expect(parseMonetaryValue('-R$ 250,00')?.value).toBe(-250.00);
+/**
+ * Generates a valid binary PDF 1.4 file with positioned text chunks (zero external dependencies).
+ */
+function buildPositionedPdfFile(
+  name: string,
+  draw: (put: (text: string, x: number, yFromTop: number) => void) => void,
+): File {
+  const ops: PdfTextOp[] = [];
+  draw((text, x, yFromTop) => {
+    ops.push({ text, x, y: 842 - yFromTop });
   });
-});
 
-describe('Multi-bank real PDF parsing & reconciliation', () => {
-  it('reconstructs Caixa Econômica multi-line descriptions, split D/C chunks, and opening/closing balances', async () => {
-    const pdf = await createMockPdf('EXTRATOCAIXASET26.pdf', [
-      [
-        { x: 40, y: 550, text: 'CAIXA ECONOMICA FEDERAL - EXTRATO POR PERIODO' },
-        { x: 40, y: 525, text: 'Data Mov.' },
-        { x: 130, y: 525, text: 'Nr. Doc.' },
-        { x: 210, y: 525, text: 'Historico' },
-        { x: 520, y: 525, text: 'Valor' },
-        { x: 660, y: 525, text: 'Saldo' },
-        { x: 40, y: 500, text: '01/09/2026' },
-        { x: 210, y: 500, text: 'SALDO ANTERIOR' },
-        { x: 660, y: 500, text: '25.977,52' },
-        { x: 718, y: 500, text: 'C' },
-        { x: 40, y: 472, text: '05/09/2026' },
-        { x: 130, y: 472, text: '31422' },
-        { x: 210, y: 472, text: 'PAGAMENTO GAS' },
-        { x: 520, y: 472, text: '12.555,84' },
-        { x: 578, y: 472, text: 'D' },
-        { x: 660, y: 472, text: '13.421,68' },
-        { x: 718, y: 472, text: 'C' },
-        { x: 210, y: 458, text: 'DO POVO' },
-        { x: 40, y: 430, text: '08/09/2026' },
-        { x: 130, y: 430, text: '90451' },
-        { x: 210, y: 430, text: 'DEPOSITO CHEQUE' },
-        { x: 520, y: 430, text: '1.578,32' },
-        { x: 578, y: 430, text: 'C' },
-        { x: 660, y: 430, text: '15.000,00' },
-        { x: 718, y: 430, text: 'C' },
-        { x: 210, y: 416, text: 'CAIXA AG' },
-      ],
-    ]);
+  const escapePdfString = (str: string) =>
+    str.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
 
-    const parsed = await parseBankStatement(pdf);
-    expect(parsed.bankName).toBe('Caixa Econômica Federal');
-    expect(parsed.openingBalance).toBe(25977.52);
-    expect(parsed.transactions).toHaveLength(2);
-    expect(parsed.transactions[0].document).toBe('31422');
-    expect(parsed.transactions[0].history).toBe('PAGAMENTO GAS DO POVO');
-    expect(parsed.transactions[0].amount).toBe(-12555.84);
-    expect(parsed.transactions[0].balance).toBe(13421.68);
-    expect(parsed.transactions[1].history).toBe('DEPOSITO CHEQUE CAIXA AG');
-    expect(parsed.transactions[1].amount).toBe(1578.32);
+  const streamContent = [
+    'BT',
+    '/F1 9 Tf',
+    ...ops.map((op) => `1 0 0 1 ${op.x} ${op.y} Tm (${escapePdfString(op.text)}) Tj`),
+    'ET',
+  ].join('\n');
 
-    const rec = computeReconciliation(parsed.transactions, parsed.openingBalance);
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n',
+    '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    `5 0 obj\n<< /Length ${streamContent.length} >>\nstream\n${streamContent}\nendstream\nendobj\n`,
+  ];
+
+  let pdf = '%PDF-1.4\n';
+  const offsets: number[] = [0];
+  for (const obj of objects) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += '0000000000 65535 f \n';
+  for (let i = 1; i <= objects.length; i += 1) {
+    pdf += `${offsets[i].toString().padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF\n`;
+
+  const bytes = new TextEncoder().encode(pdf);
+  return new File([bytes], name, { type: 'application/pdf' });
+}
+
+describe('Conversor de Extratos + Agente de I.A. Evolutivo', () => {
+  it('normaliza formatos monetários brasileiros com D/C, (+)/(-), sinal posterior e parênteses', () => {
+    expect(parseMonetaryValue('1.520,40 C')?.value).toBe(1520.4);
+    expect(parseMonetaryValue('320,15 D')?.value).toBe(-320.15);
+    expect(parseMonetaryValue('890,00 (-)')?.value).toBe(-890);
+    expect(parseMonetaryValue('2.100,00 (+)')?.value).toBe(2100);
+    expect(parseMonetaryValue('450,90-')?.value).toBe(-450.9);
+    expect(parseMonetaryValue('- R$ 99,99')?.value).toBe(-99.99);
+    expect(parseMonetaryValue('(1.234,56)')?.value).toBe(-1234.56);
+    expect(readDate('05/03/2026')).toBe('2026-03-05');
+    expect(readDate('2026-03-05')).toBe('2026-03-05');
+  });
+
+  it('lê extrato PDF estilo Caixa Econômica Federal (sufixos C/D + Saldo Anterior) e concilia 100%', async () => {
+    const file = buildPositionedPdfFile('extrato-caixa.pdf', (text) => {
+      text('CAIXA ECONOMICA FEDERAL - EXTRATO CONTA CORRENTE', 40, 40);
+      text('Periodo: 01/03/2026 a 31/03/2026', 40, 56);
+      text('Data Mov.', 40, 80);
+      text('Nr. Doc.', 110, 80);
+      text('Historico', 180, 80);
+      text('Valor', 420, 80);
+      text('Saldo', 510, 80);
+
+      text('01/03/2026', 40, 100);
+      text('000000', 110, 100);
+      text('SALDO ANTERIOR', 180, 100);
+      text('1.000,00 C', 510, 100);
+
+      text('03/03/2026', 40, 118);
+      text('102938', 110, 118);
+      text('CRED PIX CLIENTE ALFA', 180, 118);
+      text('2.500,00 C', 420, 118);
+      text('3.500,00 C', 510, 118);
+
+      text('05/03/2026', 40, 136);
+      text('482910', 110, 136);
+      text('PAG BOLETO ENERGIA', 180, 136);
+      text('400,00 D', 420, 136);
+      text('3.100,00 C', 510, 136);
+    });
+
+    const result = await parseUnifiedStatement(file);
+    expect(result.bankName).toBe('Caixa Econômica Federal');
+    expect(result.openingBalance).toBe(1000);
+    expect(result.transactions).toHaveLength(2);
+    expect(result.updatedModel.bankName).toBe('Caixa Econômica Federal');
+    expect(result.updatedModel.accuracyScore).toBe(100);
+
+    const rec = computeReconciliation(result.transactions, result.openingBalance);
     expect(rec.divergentDaysCount).toBe(0);
-    expect(rec.calculatedClosingBalance).toBe(15000);
+    expect(rec.calculatedClosingBalance).toBe(3100);
   });
 
-  it('parses Itaú short DD/MM dates using header period year and trailing minus sign', async () => {
-    const pdf = await createMockPdf('extrato-itau.pdf', [
-      [
-        { x: 40, y: 550, text: 'ITAU UNIBANCO S.A. - Extrato de Conta Corrente' },
-        { x: 40, y: 530, text: 'Periodo: 01/09/2026 a 30/09/2026' },
-        { x: 40, y: 495, text: '10/09' },
-        { x: 110, y: 495, text: 'PIX TRANSF JOAO SILVA' },
-        { x: 500, y: 495, text: '450,00-' },
-        { x: 40, y: 472, text: '14/09' },
-        { x: 110, y: 472, text: 'TED RECEBIDA CLIENTE SUL' },
-        { x: 500, y: 472, text: '2.200,00' },
-      ],
-    ]);
+  it('lê extrato PDF estilo Banco do Brasil com datas curtas DD/MM e sinais (+)/(-)', async () => {
+    const file = buildPositionedPdfFile('extrato-bb.pdf', (text) => {
+      text('BANCO DO BRASIL S.A. - SISBB', 40, 40);
+      text('Periodo do extrato: 01/02/2026 a 28/02/2026', 40, 56);
+      text('Data', 40, 80);
+      text('Historico', 120, 80);
+      text('Valor', 420, 80);
+      text('Saldo', 510, 80);
 
-    const parsed = await parseBankStatement(pdf);
-    expect(parsed.bankName).toBe('Itaú Unibanco');
-    expect(parsed.transactions).toHaveLength(2);
-    expect(parsed.transactions[0].date).toBe('2026-09-10');
-    expect(parsed.transactions[0].amount).toBe(-450);
-    expect(parsed.transactions[1].date).toBe('2026-09-14');
-    expect(parsed.transactions[1].amount).toBe(2200);
+      text('02/02', 40, 102);
+      text('TED RECEBIDA MATRIZ', 120, 102);
+      text('5.000,00 (+)', 415, 102);
+      text('5.000,00 (+)', 505, 102);
+
+      text('10/02', 40, 120);
+      text('TARIFA PACOTE PJ', 120, 120);
+      text('89,90 (-)', 415, 120);
+      text('4.910,10 (+)', 505, 120);
+    });
+
+    const result = await parseUnifiedStatement(file);
+    expect(result.bankName).toBe('Banco do Brasil');
+    expect(result.transactions).toHaveLength(2);
+    expect(result.transactions[0].date).toBe('2026-02-02');
+    expect(result.transactions[0].amount).toBe(5000);
+    expect(result.transactions[1].date).toBe('2026-02-10');
+    expect(result.transactions[1].amount).toBe(-89.9);
   });
 
-  it('parses Bradesco same-day rows without repeated date and preserves legitimate identical fees while deduplicating overlapping PDFs', async () => {
-    const pdfA = await createMockPdf('bradesco-parte1.pdf', [
-      [
-        { x: 40, y: 550, text: 'BANCO BRADESCO S.A. Extrato Mensal' },
-        { x: 40, y: 505, text: '12/09/2026' },
-        { x: 140, y: 505, text: 'TARIFA BANCARIA PIX' },
-        { x: 500, y: 505, text: '-5,50' },
-        // Second identical fee on same day without repeating date!
-        { x: 140, y: 485, text: 'TARIFA BANCARIA PIX' },
-        { x: 500, y: 485, text: '-5,50' },
-      ],
-    ]);
+  it('lê extrato PDF estilo Nubank com datas por extenso ("05 MAR 2026") e múltiplas transações no mesmo dia', async () => {
+    const file = buildPositionedPdfFile('extrato-nubank.pdf', (text) => {
+      text('Nu Pagamentos S.A. - Extrato de Conta', 40, 40);
+      text('01 MAR 2026 a 31 MAR 2026', 40, 56);
 
-    const resA = await parseBankStatement(pdfA, undefined, 'src-a');
-    expect(resA.transactions).toHaveLength(2);
-    expect(resA.transactions[0].date).toBe('2026-09-12');
-    expect(resA.transactions[1].date).toBe('2026-09-12');
+      text('05 MAR 2026', 40, 90);
+      text('Transferencia recebida pelo Pix - JOAO SILVA', 140, 90);
+      text('1.200,00', 460, 90);
 
-    const step1 = mergeWithSmartDedup([], resA.transactions, true);
-    expect(step1.records).toHaveLength(2);
-    expect(step1.duplicatesCount).toBe(0);
+      text('Pagamento de boleto efetuado - INTERNET FIBRA', 140, 108);
+      text('-149,90', 460, 108);
+    });
 
-    // Re-importing the overlapping PDF removes the 2 cross-file duplicates while keeping the original 2!
-    const resB = await parseBankStatement(pdfA, undefined, 'src-b');
-    const step2 = mergeWithSmartDedup(step1.records, resB.transactions, true);
-    expect(step2.records).toHaveLength(2);
-    expect(step2.duplicatesCount).toBe(2);
+    const result = await parseUnifiedStatement(file);
+    expect(result.bankName).toBe('Nubank');
+    expect(result.transactions).toHaveLength(2);
+    expect(result.transactions[0].date).toBe('2026-03-05');
+    expect(result.transactions[0].amount).toBe(1200);
+    expect(result.transactions[1].date).toBe('2026-03-05');
+    expect(result.transactions[1].amount).toBe(-149.9);
   });
 
-  it('parses Banco do Brasil (+)/(-) suffixes with HH:MM timestamp continuations and Nubank written date headers', async () => {
-    const bbPdf = await createMockPdf('extrato-bb.pdf', [
-      [
-        { x: 40, y: 550, text: 'BANCO DO BRASIL S.A. - SISBB' },
-        { x: 40, y: 500, text: '06/09/2026' },
-        { x: 130, y: 500, text: '88201' },
-        { x: 210, y: 500, text: 'PIX ENVIADO' },
-        { x: 520, y: 500, text: '1.250,00 (-)' },
-        { x: 210, y: 486, text: '06/09 14:32' },
-        { x: 210, y: 472, text: 'FORNECEDOR ALFA LTDA' },
-        { x: 40, y: 444, text: '07/09/2026' },
-        { x: 130, y: 444, text: '88299' },
-        { x: 210, y: 444, text: 'PIX RECEBIDO' },
-        { x: 520, y: 444, text: '3.900,00 (+)' },
-        { x: 210, y: 430, text: 'CLIENTE BETA SA' },
-      ],
-    ]);
+  it('aprende continuamente com correções e evolui nos meses seguintes do mesmo banco', async () => {
+    // Mês 1: Layout de banco regional com linha de ruído proprietária e rubrica sem sinal explícito
+    const month1Pdf = buildPositionedPdfFile('banco-regional-jan.pdf', (text) => {
+      text('BANCO SAFRA S.A. - EXTRATO EMPRESARIAL', 40, 40);
+      text('Periodo: 01/01/2026 a 31/01/2026', 40, 56);
+      text('Data', 40, 80);
+      text('Historico Operacional', 120, 80);
+      text('Valor', 450, 80);
 
-    const bbRes = await parseBankStatement(bbPdf);
-    expect(bbRes.bankName).toBe('Banco do Brasil');
-    expect(bbRes.transactions).toHaveLength(2);
-    expect(bbRes.transactions[0].history).toBe('PIX ENVIADO FORNECEDOR ALFA LTDA');
-    expect(bbRes.transactions[0].amount).toBe(-1250);
-    expect(bbRes.transactions[1].history).toBe('PIX RECEBIDO CLIENTE BETA SA');
-    expect(bbRes.transactions[1].amount).toBe(3900);
+      text('10/01/2026', 40, 102);
+      text('RESUMO PARCIAL CARTEIRA VINCULADA', 120, 102);
+      text('9.999,00', 450, 102);
 
-    const nuPdf = await createMockPdf('extrato-nubank.pdf', [
-      [
-        { x: 40, y: 550, text: 'Nu Pagamentos S.A. - Extrato Setembro 2026' },
-        { x: 40, y: 505, text: '18 SET 2026' },
-        { x: 140, y: 488, text: 'Transferencia recebida pelo Pix - Carla Souza' },
-        { x: 520, y: 488, text: 'R$ 850,00' },
-        { x: 140, y: 468, text: 'Compra no debito - Posto Avenida' },
-        { x: 520, y: 468, text: '-R$ 210,40' },
-      ],
-    ]);
+      text('12/01/2026', 40, 120);
+      text('LIQ COBRANCA VINCULADA 00419', 120, 120);
+      text('850,00', 450, 120);
 
-    const nuRes = await parseBankStatement(nuPdf);
-    expect(nuRes.bankName).toBe('Nubank');
-    expect(nuRes.transactions).toHaveLength(2);
-    expect(nuRes.transactions[0].date).toBe('2026-09-18');
-    expect(nuRes.transactions[0].amount).toBe(850);
-    expect(nuRes.transactions[1].date).toBe('2026-09-18');
-    expect(nuRes.transactions[1].amount).toBe(-210.4);
+      text('15/01/2026', 40, 138);
+      text('TAXA CUSTODIA ESPECIAL 8821', 120, 138);
+      text('125,00', 450, 138);
+    });
+
+    const pass1 = await parseUnifiedStatement(month1Pdf);
+    expect(pass1.wasKnownModel).toBe(false);
+    expect(pass1.transactions).toHaveLength(3);
+
+    // Usuário exclui a linha de resumo parcial e inverte a taxa de custódia para Débito (-)
+    let memory = [pass1.updatedModel];
+    memory = recordIgnoredRowInModel(memory, pass1.transactions[0]).models;
+    memory = recordSignCorrectionInModel(memory, pass1.transactions[2], -125).models;
+
+    // Mês 2: Novo PDF do mesmo banco com datas, números de contrato e valores totalmente diferentes
+    const month2Pdf = buildPositionedPdfFile('banco-regional-fev.pdf', (text) => {
+      text('BANCO SAFRA S.A. - EXTRATO EMPRESARIAL', 40, 40);
+      text('Periodo: 01/02/2026 a 28/02/2026', 40, 56);
+      text('Data', 40, 80);
+      text('Historico Operacional', 120, 80);
+      text('Valor', 450, 80);
+
+      text('08/02/2026', 40, 102);
+      text('RESUMO PARCIAL CARTEIRA VINCULADA', 120, 102);
+      text('14.320,00', 450, 102);
+
+      text('14/02/2026', 40, 120);
+      text('LIQ COBRANCA VINCULADA 00987', 120, 120);
+      text('1.400,00', 450, 120);
+
+      text('19/02/2026', 40, 138);
+      text('TAXA CUSTODIA ESPECIAL 9954', 120, 138);
+      text('210,50', 450, 138);
+    });
+
+    const pass2 = await parseUnifiedStatement(month2Pdf, { learnedModels: memory });
+    expect(pass2.wasKnownModel).toBe(true);
+    expect(pass2.updatedModel.timesSeen).toBe(2);
+    expect(pass2.transactions).toHaveLength(2);
+    expect(pass2.transactions[0].amount).toBe(1400);
+    expect(pass2.transactions[1].amount).toBe(-210.5);
   });
 
-  it('supports full roundtrip export & re-import for CSV, OFX, and multi-sheet XLSX', async () => {
-    const pdf = await createMockPdf('roundtrip.pdf', [
-      [
-        { x: 40, y: 500, text: '15/09/2026  44120  PIX RECEBIDO LOJA NORTE  3.100,00 C  3.100,00 C' },
-        { x: 40, y: 475, text: '16/09/2026  44121  DARF SIMPLES NACIONAL  610,00 D  2.490,00 C' },
-      ],
-    ]);
-    const parsed = await parseBankStatement(pdf);
-    const rec = computeReconciliation(parsed.transactions, 0);
+  it('auto-corrige divergência combinatória de saldo durante a leitura e memoriza o padrão', async () => {
+    const trickyPdf = buildPositionedPdfFile('layout-subtotal-oculto.pdf', (text) => {
+      text('SICREDI - EXTRATO CONTA CORRENTE', 40, 40);
+      text('Data', 40, 80);
+      text('Historico', 120, 80);
+      text('Valor', 420, 80);
+      text('Saldo', 510, 80);
 
-    const wb = buildWorkbook(parsed.transactions, rec, 'completo');
-    expect(wb.SheetNames).toEqual([
-      'Lançamentos',
-      'Resumo Mensal',
-      'Por Categoria',
-      'Conciliação Diária',
-    ]);
+      text('01/04/2026', 40, 100);
+      text('SALDO ANTERIOR', 120, 100);
+      text('1.000,00', 510, 100);
 
-    const ofxText = buildOfxContent(parsed.transactions, rec);
-    const ofxBytes = new TextEncoder().encode(ofxText);
-    const ofxFile = {
-      name: 'teste.ofx',
-      arrayBuffer: async () => ofxBytes.buffer,
-    } as unknown as File;
-    const reimportedOfx = await parseOfxStatement(ofxFile);
-    expect(reimportedOfx.transactions).toHaveLength(2);
-    expect(reimportedOfx.transactions[1].amount).toBe(-610);
+      text('04/04/2026', 40, 118);
+      text('SUBTOTAL CONTA VINCULADA', 120, 118);
+      text('500,00', 420, 118);
 
-    const csvText = buildCsvContent(parsed.transactions, 'contabil');
-    const csvBytes = new TextEncoder().encode(csvText);
-    const csvFile = {
-      name: 'teste.csv',
-      arrayBuffer: async () => csvBytes.buffer,
-    } as unknown as File;
-    const reimportedCsv = await parseCsvStatement(csvFile);
-    expect(reimportedCsv.transactions).toHaveLength(2);
-    expect(reimportedCsv.transactions[0].credit).toBe(3100);
-    expect(reimportedCsv.transactions[1].debit).toBe(610);
+      text('04/04/2026', 40, 136);
+      text('CRED PIX CPF 12345678900 CONTA CORRENTE', 120, 136);
+      text('300,00', 420, 136);
+      text('1.300,00', 510, 136);
+    });
+
+    const res = await parseUnifiedStatement(trickyPdf);
+    expect(res.transactions).toHaveLength(1);
+    expect(res.transactions[0].history).toContain('CRED PIX CPF 12345678900 CONTA CORRENTE');
+    expect(res.updatedModel.ignoredPatterns).toContain('SUBTOTAL CONTA VINCULADA');
+    expect(res.updatedModel.accuracyScore).toBe(100);
+  });
+
+  it('lê arquivos OFX e CSV nativamente e deduplica extratos sobrepostos sem perder transferências legítimas', async () => {
+    const ofxContent = `
+OFXHEADER:100
+<OFX>
+  <BANKMSGSRSV1>
+    <STMTTRNRS>
+      <STMTRS>
+        <BANKACCTFROM><BANKID>0341</BANKID></BANKACCTFROM>
+        <BANKTRANLIST>
+          <STMTTRN>
+            <TRNTYPE>CREDIT
+            <DTPOSTED>20260310000000
+            <TRNAMT>750.25
+            <FITID>20260310001
+            <MEMO>PIX RECEBIDO CLIENTE BETA
+          </STMTTRN>
+          <STMTTRN>
+            <TRNTYPE>DEBIT
+            <DTPOSTED>20260310000000
+            <TRNAMT>-120.00
+            <FITID>20260310002
+            <MEMO>PIX ENVIADO FORNECEDOR
+          </STMTTRN>
+          <STMTTRN>
+            <TRNTYPE>DEBIT
+            <DTPOSTED>20260310000000
+            <TRNAMT>-120.00
+            <FITID>20260310003
+            <MEMO>PIX ENVIADO FORNECEDOR
+          </STMTTRN>
+        </BANKTRANLIST>
+        <LEDGERBAL><BALAMT>510.25</BALAMT></LEDGERBAL>
+      </STMTRS>
+    </STMTTRNRS>
+  </BANKMSGSRSV1>
+</OFX>`;
+
+    const ofxFile = new File([ofxContent], 'itau-marco.ofx', { type: 'application/x-ofx' });
+    const parsedOfx = await parseUnifiedStatement(ofxFile, { sourceId: 'file-1' });
+    expect(parsedOfx.transactions).toHaveLength(3);
+
+    const csvOverlap = [
+      'Data;Histórico;Valor',
+      '10/03/2026;PIX RECEBIDO CLIENTE BETA;750,25',
+      '12/03/2026;TARIFA BANCARIA;-29,90',
+    ].join('\n');
+    const csvFile = new File([csvOverlap], 'itau-complemento.csv', { type: 'text/csv' });
+    const parsedCsv = await parseUnifiedStatement(csvFile, { sourceId: 'file-2' });
+
+    const merged = mergeWithSmartDedup(parsedOfx.transactions, parsedCsv.transactions, true);
+    expect(merged.duplicatesCount).toBe(1);
+    expect(merged.records).toHaveLength(4);
   });
 });

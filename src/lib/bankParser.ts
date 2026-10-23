@@ -1,8 +1,25 @@
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { createWorker, type Worker as TesseractWorker } from 'tesseract.js';
 import * as XLSX from 'xlsx';
-import type { CategoryRule, FileFormat, ParseFileOptions, ParseFileResult, Transaction } from '../types';
-import { classifyTransaction } from './categorizer';
+import type {
+  AiProviderConfig,
+  FileFormat,
+  LearnedColumns,
+  LearnedLayoutModel,
+  ParseFileOptions,
+  ParseFileResult,
+  Transaction,
+} from '../types';
+import {
+  blendColumns,
+  computeLayoutFingerprint,
+  diagnoseAndSolveDivergences,
+  extractReusablePatternStem,
+  findMatchingLayoutModel,
+  normalizeHeaderTokens,
+  queryExternalAiForRawLines,
+} from './layoutAgent';
+import { computeReconciliation } from './reconciliation';
 
 export class PasswordRequiredError extends Error {
   readonly incorrectPassword: boolean;
@@ -84,6 +101,8 @@ const PT_MONTHS: Record<string, number> = {
 
 const FULL_DATE_PATTERN = /(?<!\d)(\d{2}[/.\-]\d{2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{2}[/.\-]\d{2})(?!\d)/g;
 const WRITTEN_DATE_LINE_PATTERN = /^(\d{1,2})\s+(?:de\s+)?([a-zç]{3,9})\.?(?:\s+(?:de\s+)?(\d{2,4}))?$/i;
+const WRITTEN_DATE_LEADING_PATTERN =
+  /^(\d{1,2})\s+(?:de\s+)?(jan(?:eiro)?|fev(?:ereiro)?|mar(?:[çc]o)?|abr(?:il)?|mai(?:o)?|jun(?:ho)?|jul(?:ho)?|ago(?:sto)?|set(?:embro)?|out(?:ubro)?|nov(?:embro)?|dez(?:embro)?)\.?(?:\s+(?:de\s+)?(\d{2,4}))?(?=\s|$)/i;
 const SHORT_DATE_LEADING_PATTERN = /^(\d{2})[/.\-](\d{2})(?=\s|$)/;
 
 const MONEY_PATTERN =
@@ -199,7 +218,7 @@ function readShortOrWrittenDate(text: string, period: StatementPeriod): string |
   const clean = text.trim();
   if (isEffectiveDateLine(clean)) return null;
 
-  const written = clean.match(WRITTEN_DATE_LINE_PATTERN);
+  const written = clean.match(WRITTEN_DATE_LEADING_PATTERN) ?? clean.match(WRITTEN_DATE_LINE_PATTERN);
   if (written) {
     const day = Number(written[1]);
     const month = PT_MONTHS[written[2].toLowerCase()];
@@ -226,7 +245,6 @@ function inferStatementPeriod(allPagesLines: PdfLine[][]): StatementPeriod {
 
   for (const lines of allPagesLines) {
     for (const line of lines.slice(0, 30)) {
-      // Skip "emitido em" lines when period lines also exist unless nothing else found
       const isEmissionLine = /\bemitido\s+em\b|\bdata\s+da\s+emiss[aã]o\b/i.test(line.text);
       const weight = isEmissionLine ? 1 : 4;
 
@@ -262,6 +280,85 @@ function inferStatementPeriod(allPagesLines: PdfLine[][]): StatementPeriod {
   }
 
   return { defaultYear, yearByMonth };
+}
+
+function detectDateAndSignStyles(allPagesLines: PdfLine[][]): {
+  dateStyle: LearnedLayoutModel['dateStyle'];
+  signStyle: LearnedLayoutModel['signStyle'];
+} {
+  const sampleText = allPagesLines
+    .flatMap((page) => page.map((l) => l.text))
+    .slice(0, 180)
+    .join('\n');
+
+  let dateStyle: LearnedLayoutModel['dateStyle'] = 'DD/MM/YYYY';
+  if (/\b\d{1,2}\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i.test(sampleText)) {
+    dateStyle = 'WRITTEN_PT';
+  } else if (/^\s*\d{2}[/.-]\d{2}(?=\s)/m.test(sampleText) && !/^\s*\d{2}[/.-]\d{2}[/.-]\d{2,4}/m.test(sampleText)) {
+    dateStyle = 'DD/MM';
+  } else if (/^\s*\d{4}-\d{2}-\d{2}/m.test(sampleText)) {
+    dateStyle = 'ISO';
+  }
+
+  let signStyle: LearnedLayoutModel['signStyle'] = 'BALANCE_INFERRED';
+  if (/\d[,.]\d{2}\s+[DC]\b/.test(sampleText)) signStyle = 'DC_SUFFIX';
+  else if (/\d[,.]\d{2}\s*\([+-]\)/.test(sampleText)) signStyle = 'PAREN_SIGN';
+  else if (/\d[,.]\d{2}-(?:\s|$)/m.test(sampleText)) signStyle = 'TRAILING_MINUS';
+  else if (/[-−–]\s*(?:R\$\s*)?\d/.test(sampleText)) signStyle = 'LEADING_SIGN';
+
+  return { dateStyle, signStyle };
+}
+
+/**
+ * Unsupervised 1D X-coordinate clustering of monetary columns when explicit headers are missing or custom.
+ */
+function discoverNumericColumnClusters(allPagesLines: PdfLine[][]): LearnedColumns {
+  const xs: number[] = [];
+  for (const lines of allPagesLines) {
+    for (const line of lines) {
+      if (OPENING_BALANCE_PATTERN.test(line.text)) continue;
+      for (const chunk of line.chunks) {
+        if (chunk.x > 160 && parseMonetaryValue(chunk.text)) {
+          xs.push(chunk.x);
+        }
+      }
+    }
+  }
+  if (xs.length < 3) return {};
+
+  const sorted = [...xs].sort((a, b) => a - b);
+  const clusters: Array<{ center: number; values: number[] }> = [];
+  for (const x of sorted) {
+    const hit = clusters.find((c) => Math.abs(c.center - x) <= 38);
+    if (hit) {
+      hit.values.push(x);
+      hit.center = hit.values.reduce((s, v) => s + v, 0) / hit.values.length;
+    } else {
+      clusters.push({ center: x, values: [x] });
+    }
+  }
+
+  const significant = clusters
+    .filter((c) => c.values.length >= Math.max(2, Math.floor(xs.length * 0.1)))
+    .sort((a, b) => a.center - b.center);
+
+  if (significant.length === 1) {
+    return { amountX: Math.round(significant[0].center) };
+  }
+  if (significant.length === 2) {
+    return {
+      amountX: Math.round(significant[0].center),
+      balanceX: Math.round(significant[1].center),
+    };
+  }
+  if (significant.length >= 3) {
+    return {
+      debitX: Math.round(significant[0].center),
+      creditX: Math.round(significant[1].center),
+      balanceX: Math.round(significant[significant.length - 1].center),
+    };
+  }
+  return {};
 }
 
 function formatDate(date: string): string {
@@ -368,7 +465,6 @@ function mergeAdjacentSignChunks(sortedChunks: TextChunk[]): TextChunk[] {
   for (let i = 0; i < sortedChunks.length; i += 1) {
     const cur = { ...sortedChunks[i] };
 
-    // Prefix chunk like "R$" or "-" or "-R$" followed immediately by digits
     if (
       /^(?:[-−–]\s*)?(?:R\$|BRL|\$)$|^[-−–]$/i.test(cur.text.trim()) &&
       i + 1 < sortedChunks.length &&
@@ -381,7 +477,6 @@ function mergeAdjacentSignChunks(sortedChunks: TextChunk[]): TextChunk[] {
       i += 1;
     }
 
-    // Trailing sign chunk like "D", "C", "(-)", "(+)", "-" right after a decimal number
     if (
       /[,.]\d{2}$/.test(cur.text.trim()) &&
       i + 1 < sortedChunks.length &&
@@ -461,13 +556,13 @@ async function readPageWithOcr(
   return makeOcrLines(result.data.text);
 }
 
-function inferColumns(lines: PdfLine[]): ColumnHints {
+function inferColumns(lines: PdfLine[], learned?: LearnedColumns, swapDebitCredit = false): ColumnHints {
   const dates: DateColumn[] = [];
   const labels: Array<{ x: number; label: string }> = [];
-  let amountX: number | undefined;
-  let debitX: number | undefined;
-  let creditX: number | undefined;
-  let balanceX: number | undefined;
+  let amountX = learned?.amountX;
+  let debitX = learned?.debitX;
+  let creditX = learned?.creditX;
+  let balanceX = learned?.balanceX;
 
   for (const line of lines.slice(0, 22)) {
     for (const chunk of line.chunks) {
@@ -486,6 +581,10 @@ function inferColumns(lines: PdfLine[]): ColumnHints {
       if (/^(?:cr[eé]dito|entrada)s?(?:\s*\(.*\))?$/i.test(label)) creditX = chunk.x;
       if (/^saldo(?:\s*\(.*\))?$/i.test(label)) balanceX = chunk.x;
     }
+  }
+
+  if (swapDebitCredit && debitX !== undefined && creditX !== undefined) {
+    [debitX, creditX] = [creditX, debitX];
   }
 
   const enrichedDates = dates.map((date) => {
@@ -539,9 +638,16 @@ function extractOpeningBalanceFromLines(lines: PdfLine[]): number | null {
   return null;
 }
 
-function isNoise(line: PdfLine): boolean {
+function isIgnoredByLearnedModel(text: string, ignoredPatterns: string[]): boolean {
+  if (!ignoredPatterns.length) return false;
+  const upper = text.toUpperCase();
+  return ignoredPatterns.some((pat) => pat.length >= 3 && upper.includes(pat.toUpperCase()));
+}
+
+function isNoise(line: PdfLine, ignoredPatterns: string[] = []): boolean {
   const value = line.text;
   if (!value || FOOTER_PATTERN.test(value)) return true;
+  if (isIgnoredByLearnedModel(value, ignoredPatterns)) return true;
   if (/about:blank|^(?:p[aá]gina|page)\s*\d+(?:\s*(?:de|of|\/)\s*\d+)?$/i.test(value.trim())) {
     return true;
   }
@@ -593,6 +699,7 @@ function nearestValue(
 function stripLeadingDates(text: string): string {
   return text
     .replace(FULL_DATE_PATTERN, ' ')
+    .replace(WRITTEN_DATE_LEADING_PATTERN, ' ')
     .replace(SHORT_DATE_LEADING_PATTERN, ' ');
 }
 
@@ -674,16 +781,29 @@ type RawParsedTx = {
   signWasAmbiguous: boolean;
 };
 
+function applyLearnedHistoryReplacements(
+  history: string,
+  model: LearnedLayoutModel,
+): string {
+  let result = history;
+  for (const rule of model.historyReplacements) {
+    if (!rule.from.trim()) continue;
+    const escaped = rule.from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    result = result.replace(new RegExp(escaped, 'gi'), rule.to);
+  }
+  return normalizeSpaces(result);
+}
+
 function parseRecord(
   record: WorkingRecord,
   fileName: string,
   bankName: string,
+  layoutModel: LearnedLayoutModel,
   sourceId: string,
   page: number,
   index: number,
   hints: ColumnHints,
   period: StatementPeriod,
-  customRules: CategoryRule[],
 ): RawParsedTx | null {
   const dateFromMain = selectedDate(record.line, hints, period);
   const dateFromCont = record.continuations
@@ -707,7 +827,6 @@ function parseRecord(
     ? { ...hints, amountX: hints.amountX ?? 500, balanceX: hints.balanceX ?? 700 }
     : hints;
 
-  // Dual debit/credit column support (Bradesco / Santander / Sicoob / Contábil)
   const hasDualColumns = hints.debitX !== undefined && hints.creditX !== undefined;
   const positionedAmount = nearestValue(positionedValues, structuredHints.amountX);
   const positionedBalance = nearestValue(positionedValues, structuredHints.balanceX);
@@ -752,16 +871,37 @@ function parseRecord(
       if (!document && parsed.document) document = parsed.document;
       return parsed.description;
     })
-    .filter((text) => text.length > 0 && !HEADER_PATTERN.test(text) && !isNoise({ text, y: 0, chunks: [] }));
+    .filter(
+      (text) =>
+        text.length > 0 &&
+        !/^(?:data(?:\s+\w+)?\s*)?(?:nr\.?\s*doc\.?|doc\.?|documento)?\s*(?:hist[oó]rico(?:\s+operacional)?|descri[çc][aã]o|lan[çc]amentos?)(?:\s+(?:valor|d[eé]bito|cr[eé]dito|saldo))?$/i.test(
+          text.trim(),
+        ) &&
+        !FOOTER_PATTERN.test(text) &&
+        !isIgnoredByLearnedModel(text, layoutModel.ignoredPatterns),
+    );
 
-  const rawHistory = normalizeHistoryParts(descriptions);
-  if (!rawHistory || hasSaldoDia(rawHistory)) return null;
+  const joinedHistory = normalizeHistoryParts(descriptions);
+  if (!joinedHistory || hasSaldoDia(joinedHistory)) return null;
+  if (isIgnoredByLearnedModel(joinedHistory, layoutModel.ignoredPatterns)) return null;
+
+  const history = applyLearnedHistoryReplacements(joinedHistory, layoutModel);
+  if (!history) return null;
+
+  const upperHistory = history.toUpperCase();
+  const learnedCreditHit = layoutModel.creditKeywords.some((kw) => upperHistory.includes(kw.toUpperCase()));
+  const learnedDebitHit = layoutModel.debitKeywords.some((kw) => upperHistory.includes(kw.toUpperCase()));
 
   const separateMinus = record.continuations.some((line) => /^[-−–]$/.test(line.text.trim()));
   let amount: number;
   let signWasAmbiguous = false;
 
-  if (amountToken.signHint === 'debit' || separateMinus) {
+  // Learned layout memory overrides generic ambiguity immediately!
+  if (learnedCreditHit && !learnedDebitHit) {
+    amount = amountToken.absValue;
+  } else if (learnedDebitHit && !learnedCreditHit) {
+    amount = -amountToken.absValue;
+  } else if (amountToken.signHint === 'debit' || separateMinus) {
     amount = -amountToken.absValue;
   } else if (amountToken.signHint === 'credit') {
     amount = amountToken.absValue;
@@ -771,23 +911,21 @@ function parseRecord(
     amount = distDebit <= distCredit ? -amountToken.absValue : amountToken.absValue;
   } else {
     signWasAmbiguous = true;
-    if (CREDIT_PATTERN.test(rawHistory)) {
+    if (CREDIT_PATTERN.test(history)) {
       amount = amountToken.absValue;
-    } else if (DEBIT_PATTERN.test(rawHistory)) {
+    } else if (DEBIT_PATTERN.test(history)) {
       amount = -amountToken.absValue;
     } else {
       amount = amountToken.value;
     }
   }
 
-  const classified = classifyTransaction(rawHistory, amount, customRules);
-
   const warnings: string[] = [];
   let confidence = 0.98;
   if (!document) {
     confidence -= 0.04;
   }
-  if (classified.history.length < 4) {
+  if (history.length < 4) {
     warnings.push('Histórico muito curto; confirme este lançamento.');
     confidence -= 0.25;
   }
@@ -802,9 +940,8 @@ function parseRecord(
       id: `${sourceId}-${page}-${index}-${date}-${amount.toFixed(2)}`,
       date,
       document,
-      history: classified.history,
-      category: classified.category,
-      accountCode: classified.accountCode,
+      history,
+      accountCode: '',
       amount,
       debit: amount < 0 ? Math.abs(amount) : 0,
       credit: amount > 0 ? amount : 0,
@@ -812,6 +949,7 @@ function parseRecord(
       sourceId,
       sourceFile: fileName,
       sourceBank: bankName,
+      layoutModelId: layoutModel.id,
       sourcePage: page,
       confidence: Math.max(0.35, Math.min(0.99, confidence)),
       warnings,
@@ -822,7 +960,6 @@ function parseRecord(
 function reconcileSignsByBalance(
   items: RawParsedTx[],
   openingBalance: number | null,
-  customRules: CategoryRule[],
 ): Transaction[] {
   let prevBalance = openingBalance;
 
@@ -849,14 +986,11 @@ function reconcileSignsByBalance(
     }
 
     if (adjustedAmount !== tx.amount) {
-      const classified = classifyTransaction(tx.history, adjustedAmount, customRules);
       return {
         ...tx,
         amount: adjustedAmount,
         debit: adjustedAmount < 0 ? Math.abs(adjustedAmount) : 0,
         credit: adjustedAmount > 0 ? adjustedAmount : 0,
-        category: classified.category,
-        accountCode: classified.accountCode,
       };
     }
 
@@ -864,7 +998,11 @@ function reconcileSignsByBalance(
   });
 }
 
-function recordsFromLines(lines: PdfLine[], period: StatementPeriod): WorkingRecord[] {
+function recordsFromLines(
+  lines: PdfLine[],
+  period: StatementPeriod,
+  ignoredPatterns: string[],
+): WorkingRecord[] {
   const records: WorkingRecord[] = [];
   let current: WorkingRecord | null = null;
   let activeDate: string | null = null;
@@ -898,7 +1036,7 @@ function recordsFromLines(lines: PdfLine[], period: StatementPeriod): WorkingRec
   };
 
   for (const line of lines) {
-    if (isNoise(line)) continue;
+    if (isNoise(line, ignoredPatterns)) continue;
 
     if (looksLikeStart(line, period)) {
       const next: WorkingRecord = { line, continuations: [] };
@@ -920,8 +1058,6 @@ function recordsFromLines(lines: PdfLine[], period: StatementPeriod): WorkingRec
       continue;
     }
 
-    // Same-day multi-transaction row without repeated date (Bradesco / Santander / Nubank group items):
-    // Only trigger when current already has its own description + money, and this line ALSO has description + money!
     if (
       activeDate &&
       current &&
@@ -931,7 +1067,6 @@ function recordsFromLines(lines: PdfLine[], period: StatementPeriod): WorkingRec
     ) {
       const { description } = stripDateAndNumbers(line);
       if (description.length >= 3 && !HEADER_PATTERN.test(description)) {
-        // Attach any prior text-only pending lines to `current` first so current's wrapped description completes cleanly
         if (pending.length > 0) {
           current.continuations.push(...pending);
           pending = [];
@@ -961,7 +1096,8 @@ export async function parseBankStatement(
   sourceId = file.name,
   password?: string,
   signal?: AbortSignal,
-  customRules: CategoryRule[] = [],
+  learnedModels: LearnedLayoutModel[] = [],
+  aiConfig: AiProviderConfig | null = null,
 ): Promise<ParseFileResult> {
   const data = new Uint8Array((await file.arrayBuffer()).slice(0));
   let document: pdfjsLib.PDFDocumentProxy;
@@ -971,7 +1107,7 @@ export async function parseBankStatement(
       password: password || undefined,
     }).promise;
   } catch (err: unknown) {
-    const errorObj = err as { name?: string; code?: number };
+    const errorObj = err as { name?: string };
     if (errorObj?.name === 'PasswordException') {
       throw new PasswordRequiredError(Boolean(password));
     }
@@ -979,6 +1115,7 @@ export async function parseBankStatement(
   }
 
   const warnings: string[] = [];
+  const agentNotes: string[] = [];
   const allPagesLines: PdfLine[][] = [];
   const ocrWorkerRef: { worker: TesseractWorker | null } = { worker: null };
 
@@ -1003,12 +1140,68 @@ export async function parseBankStatement(
     }
   }
 
+  const headerLines = allPagesLines[0]?.slice(0, 22).map((l) => l.text) ?? [];
   const headerSample = allPagesLines
     .slice(0, 2)
     .flatMap((l) => l.slice(0, 25).map((item) => item.text))
     .join('\n');
-  const bankName = detectBankName(headerSample);
+  let bankName = detectBankName(headerSample);
+  const headerTokens = normalizeHeaderTokens(headerLines);
+  const { dateStyle, signStyle } = detectDateAndSignStyles(allPagesLines);
+  const discoveredColumns = discoverNumericColumnClusters(allPagesLines);
   const period = inferStatementPeriod(allPagesLines);
+
+  const matchResult = findMatchingLayoutModel(
+    learnedModels,
+    bankName,
+    headerTokens,
+    dateStyle,
+    signStyle,
+    discoveredColumns,
+  );
+
+  const nowIso = new Date().toISOString();
+  const wasKnownModel = matchResult.model !== null;
+
+  let activeModel: LearnedLayoutModel = matchResult.model
+    ? {
+        ...matchResult.model,
+        columns: blendColumns(matchResult.model.columns, discoveredColumns),
+      }
+    : {
+        id: crypto.randomUUID(),
+        fingerprint: computeLayoutFingerprint(bankName, headerTokens, dateStyle, signStyle),
+        name:
+          bankName !== 'Extrato Bancário'
+            ? `${bankName} · Layout ${dateStyle}`
+            : `Layout Personalizado (${file.name.replace(/\.[^.]+$/, '').slice(0, 22)})`,
+        bankName,
+        headerTokens,
+        dateStyle,
+        signStyle,
+        columns: discoveredColumns,
+        creditKeywords: [],
+        debitKeywords: [],
+        ignoredPatterns: [],
+        historyReplacements: [],
+        timesSeen: 0,
+        totalTransactions: 0,
+        accuracyScore: 92,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+  if (wasKnownModel) {
+    agentNotes.push(
+      `Layout reconhecido na memória da I.A.: "${activeModel.name}" (${Math.round(
+        matchResult.similarity * 100,
+      )}% compatível, ${activeModel.creditKeywords.length + activeModel.debitKeywords.length + activeModel.ignoredPatterns.length} regra(s) aplicada(s)).`,
+    );
+  } else {
+    agentNotes.push(
+      `Novo modelo de layout catalogado pela I.A.: "${activeModel.name}" (formato ${dateStyle}, sinal ${signStyle}).`,
+    );
+  }
 
   let openingBalance: number | null = null;
   for (const pageLines of allPagesLines) {
@@ -1022,33 +1215,137 @@ export async function parseBankStatement(
   const rawParsed: RawParsedTx[] = [];
   allPagesLines.forEach((lines, idx) => {
     const pageNumber = idx + 1;
-    const hints = inferColumns(lines);
-    const records = recordsFromLines(lines, period);
+    const hints = inferColumns(lines, activeModel.columns, Boolean(activeModel.swapDebitCreditColumns));
+    const records = recordsFromLines(lines, period, activeModel.ignoredPatterns);
     const parsedPage = records
       .map((record, rIndex) =>
         parseRecord(
           record,
           file.name,
           bankName,
+          activeModel,
           sourceId,
           pageNumber,
           rIndex,
           hints,
           period,
-          customRules,
         ),
       )
       .filter((entry): entry is RawParsedTx => entry !== null);
     rawParsed.push(...parsedPage);
   });
 
-  const transactions = reconcileSignsByBalance(rawParsed, openingBalance, customRules);
+  let transactions = reconcileSignsByBalance(rawParsed, openingBalance);
+
+  // External Generative AI fallback/enhancement if configured and layout yielded 0 rows
+  if (transactions.length === 0 && aiConfig?.apiKey?.trim()) {
+    const flatRaw = allPagesLines.flatMap((p) => p.map((l) => l.text));
+    const llmResult = await queryExternalAiForRawLines(flatRaw, aiConfig);
+    if (llmResult.bankName) bankName = llmResult.bankName;
+    activeModel = {
+      ...activeModel,
+      bankName,
+      creditKeywords: [...new Set([...activeModel.creditKeywords, ...(llmResult.creditKeywords ?? [])])],
+      debitKeywords: [...new Set([...activeModel.debitKeywords, ...(llmResult.debitKeywords ?? [])])],
+      ignoredPatterns: [...new Set([...activeModel.ignoredPatterns, ...(llmResult.ignoredPatterns ?? [])])],
+    };
+    transactions = (llmResult.transactions ?? []).map((item, idx) => ({
+      id: `${sourceId}-ai-${idx}-${item.date}-${item.amount.toFixed(2)}`,
+      date: item.date,
+      document: item.document ?? '',
+      history: item.history,
+      accountCode: '',
+      amount: item.amount,
+      debit: item.amount < 0 ? Math.abs(item.amount) : 0,
+      credit: item.amount > 0 ? item.amount : 0,
+      balance: item.balance ?? null,
+      sourceId,
+      sourceFile: file.name,
+      sourceBank: bankName,
+      layoutModelId: activeModel.id,
+      sourcePage: 1,
+      confidence: 0.95,
+      warnings: [],
+    }));
+    agentNotes.push(
+      `Agente de I.A. Generativa extraiu ${transactions.length} lançamento(s) e salvou padrões do layout.`,
+    );
+  }
+
+  // Autonomous Combinatorial Self-Correction pass:
+  // If any day has a balance discrepancy solvable to 0.00 cents, auto-fix AND teach `activeModel` immediately!
+  const initialRec = computeReconciliation(transactions, openingBalance);
+  if (initialRec.divergentDaysCount > 0) {
+    const autoFixes = diagnoseAndSolveDivergences(transactions, initialRec);
+    if (autoFixes.length > 0) {
+      const removeIds = new Set(
+        autoFixes.filter((f) => f.action === 'remove-noise').map((f) => f.transactionId),
+      );
+      const flipIds = new Set(
+        autoFixes.filter((f) => f.action === 'invert-sign').map((f) => f.transactionId),
+      );
+
+      for (const fix of autoFixes) {
+        const stem = extractReusablePatternStem(fix.history);
+        if (fix.action === 'remove-noise' && stem.length >= 4) {
+          activeModel.ignoredPatterns = [...new Set([stem, ...activeModel.ignoredPatterns])];
+        } else if (fix.action === 'invert-sign' && stem.length >= 3) {
+          if (fix.newAmount > 0) {
+            activeModel.creditKeywords = [...new Set([stem, ...activeModel.creditKeywords])];
+          } else {
+            activeModel.debitKeywords = [...new Set([stem, ...activeModel.debitKeywords])];
+          }
+        }
+      }
+
+      transactions = transactions
+        .filter((tx) => !removeIds.has(tx.id))
+        .map((tx) => {
+          if (!flipIds.has(tx.id)) return tx;
+          const flipped = -tx.amount;
+          return {
+            ...tx,
+            amount: flipped,
+            debit: flipped < 0 ? Math.abs(flipped) : 0,
+            credit: flipped > 0 ? flipped : 0,
+          };
+        });
+
+      agentNotes.push(
+        `Auto-calibração de saldo da I.A.: ${autoFixes.length} ajuste(s) aplicado(s) automaticamente e memorizado(s) para este modelo.`,
+      );
+    }
+  }
+
+  const finalRec = computeReconciliation(transactions, openingBalance);
+  const measuredAccuracy =
+    finalRec.checkedDaysCount > 0
+      ? Math.round(
+          ((finalRec.checkedDaysCount - finalRec.divergentDaysCount) /
+            finalRec.checkedDaysCount) *
+            100,
+        )
+      : transactions.length > 0
+        ? 95
+        : 50;
+
+  const updatedModel: LearnedLayoutModel = {
+    ...activeModel,
+    timesSeen: activeModel.timesSeen + 1,
+    totalTransactions: activeModel.totalTransactions + transactions.length,
+    accuracyScore:
+      activeModel.timesSeen > 0
+        ? Math.round(activeModel.accuracyScore * 0.4 + measuredAccuracy * 0.6)
+        : measuredAccuracy,
+    updatedAt: nowIso,
+  };
+
   const closingBalance =
     [...transactions].reverse().find((tx) => tx.balance !== null)?.balance ?? null;
 
   if (transactions.length === 0) {
     warnings.push(
-      'Nenhum lançamento estruturado foi localizado. O PDF pode ser imagem digitalizada, comprovante isolado ou ter um layout que exige conferência manual.',
+      'Nenhum lançamento estruturado foi localizado. Use o Agente de I.A. abaixo para calibrar este layout.',
     );
   }
 
@@ -1059,6 +1356,9 @@ export async function parseBankStatement(
     bankName,
     openingBalance,
     closingBalance,
+    updatedModel,
+    wasKnownModel,
+    agentNotes,
   };
 }
 
@@ -1071,10 +1371,55 @@ function decodeTextBuffer(buffer: ArrayBuffer): string {
   return utf8;
 }
 
+function buildOrUpdateTabularModel(
+  learnedModels: LearnedLayoutModel[],
+  bankName: string,
+  formatLabel: string,
+  headerTokens: string[],
+  txCount: number,
+): { model: LearnedLayoutModel; wasKnown: boolean } {
+  const nowIso = new Date().toISOString();
+  const fp = computeLayoutFingerprint(bankName, headerTokens, 'DD/MM/YYYY', 'LEADING_SIGN');
+  const existing = learnedModels.find((m) => m.fingerprint === fp);
+  if (existing) {
+    return {
+      wasKnown: true,
+      model: {
+        ...existing,
+        timesSeen: existing.timesSeen + 1,
+        totalTransactions: existing.totalTransactions + txCount,
+        updatedAt: nowIso,
+      },
+    };
+  }
+  return {
+    wasKnown: false,
+    model: {
+      id: crypto.randomUUID(),
+      fingerprint: fp,
+      name: `${bankName} · ${formatLabel}`,
+      bankName,
+      headerTokens,
+      dateStyle: 'DD/MM/YYYY',
+      signStyle: 'LEADING_SIGN',
+      columns: {},
+      creditKeywords: [],
+      debitKeywords: [],
+      ignoredPatterns: [],
+      historyReplacements: [],
+      timesSeen: 1,
+      totalTransactions: txCount,
+      accuracyScore: 99,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    },
+  };
+}
+
 export async function parseOfxStatement(
   file: File,
   sourceId = file.name,
-  customRules: CategoryRule[] = [],
+  learnedModels: LearnedLayoutModel[] = [],
 ): Promise<ParseFileResult> {
   const text = decodeTextBuffer(await file.arrayBuffer());
   const orgMatch = text.match(/<ORG>([^<\r\n]+)/i);
@@ -1082,6 +1427,14 @@ export async function parseOfxStatement(
   const bankName = detectBankName(`${orgMatch?.[1] ?? ''} ${bankIdMatch?.[1] ?? ''} ${file.name}`);
 
   const blocks = text.split(/<STMTTRN>/i).slice(1);
+  const { model, wasKnown } = buildOrUpdateTabularModel(
+    learnedModels,
+    bankName,
+    'Modelo OFX',
+    ['ofx', bankName.toLowerCase()],
+    blocks.length,
+  );
+
   const transactions: Transaction[] = [];
 
   blocks.forEach((rawBlock, index) => {
@@ -1107,17 +1460,17 @@ export async function parseOfxStatement(
     const namePart = tag('NAME');
     const memoPart = tag('MEMO');
     const combinedHistory = normalizeHistoryParts([namePart, memoPart]);
-    const history = combinedHistory || 'LANÇAMENTO OFX';
+    const history = applyLearnedHistoryReplacements(combinedHistory || 'LANÇAMENTO OFX', model);
+    if (isIgnoredByLearnedModel(history, model.ignoredPatterns)) return;
+
     const document = tag('CHECKNUM') || tag('REFNUM') || tag('FITID').slice(-10);
-    const classified = classifyTransaction(history, amount, customRules);
 
     transactions.push({
       id: `${sourceId}-ofx-${index}-${isoDate}-${amount.toFixed(2)}`,
       date: isoDate,
       document,
-      history: classified.history,
-      category: classified.category,
-      accountCode: classified.accountCode,
+      history,
+      accountCode: '',
       amount,
       debit: amount < 0 ? Math.abs(amount) : 0,
       credit: amount > 0 ? amount : 0,
@@ -1125,6 +1478,7 @@ export async function parseOfxStatement(
       sourceId,
       sourceFile: file.name,
       sourceBank: bankName,
+      layoutModelId: model.id,
       sourcePage: 1,
       confidence: 0.99,
       warnings: [],
@@ -1144,6 +1498,13 @@ export async function parseOfxStatement(
     bankName,
     openingBalance: null,
     closingBalance: closingBalance !== null && Number.isFinite(closingBalance) ? closingBalance : null,
+    updatedModel: { ...model, totalTransactions: (model.totalTransactions - blocks.length) + transactions.length },
+    wasKnownModel: wasKnown,
+    agentNotes: [
+      wasKnown
+        ? `Modelo OFX reconhecido na memória: "${model.name}".`
+        : `Modelo OFX registrado na memória: "${model.name}".`,
+    ],
   };
 }
 
@@ -1151,22 +1512,35 @@ function parseTabularRows(
   rows: string[][],
   fileName: string,
   sourceId: string,
-  customRules: CategoryRule[],
+  learnedModels: LearnedLayoutModel[],
 ): ParseFileResult {
-  const headerIdx = rows.findIndex((row) =>
-    row.some((cell) => /\bdata\b/i.test(cell)) &&
-    row.some((cell) => /(valor|d[eé]bito|cr[eé]dito|hist[oó]rico|descri[çc][aã]o|lan[çc]amento)/i.test(cell)),
+  const bankName = detectBankName(fileName);
+  const headerIdx = rows.findIndex(
+    (row) =>
+      row.some((cell) => /\bdata\b/i.test(cell)) &&
+      row.some((cell) => /(valor|d[eé]bito|cr[eé]dito|hist[oó]rico|descri[çc][aã]o|lan[çc]amento)/i.test(cell)),
   );
 
-  const warnings: string[] = [];
+  const headerTokens = headerIdx !== -1 ? normalizeHeaderTokens([rows[headerIdx].join(' ')]) : ['tabular'];
+  const { model, wasKnown } = buildOrUpdateTabularModel(
+    learnedModels,
+    bankName,
+    'Planilha / CSV',
+    headerTokens,
+    0,
+  );
+
   if (headerIdx === -1) {
     return {
       transactions: [],
       pages: 1,
       warnings: ['Cabeçalho tabular (Data / Histórico / Valor) não identificado no arquivo.'],
-      bankName: detectBankName(fileName),
+      bankName,
       openingBalance: null,
       closingBalance: null,
+      updatedModel: model,
+      wasKnownModel: wasKnown,
+      agentNotes: [],
     };
   }
 
@@ -1204,34 +1578,32 @@ function parseTabularRows(
     }
     if (amount === null) continue;
 
-    const history = normalizeSpaces(histCol !== -1 ? row[histCol] ?? '' : 'LANÇAMENTO IMPORTADO');
-    if (!history || hasSaldoDia(history)) continue;
+    const rawHistory = normalizeSpaces(histCol !== -1 ? row[histCol] ?? '' : 'LANÇAMENTO IMPORTADO');
+    if (!rawHistory || hasSaldoDia(rawHistory)) continue;
+    if (isIgnoredByLearnedModel(rawHistory, model.ignoredPatterns)) continue;
+
+    const history = applyLearnedHistoryReplacements(rawHistory, model);
     const document = normalizeSpaces(docCol !== -1 ? row[docCol] ?? '' : '');
     const balToken = balCol !== -1 ? parseMonetaryValue(row[balCol] ?? '') : null;
-    const classified = classifyTransaction(history, amount, customRules);
 
     transactions.push({
       id: `${sourceId}-row-${r}-${isoDate}-${amount.toFixed(2)}`,
       date: isoDate,
       document,
-      history: classified.history,
-      category: classified.category,
-      accountCode: classified.accountCode,
+      history,
+      accountCode: '',
       amount,
       debit: amount < 0 ? Math.abs(amount) : 0,
       credit: amount > 0 ? amount : 0,
       balance: balToken ? balToken.value : null,
       sourceId,
       sourceFile: fileName,
-      sourceBank: detectBankName(fileName),
+      sourceBank: bankName,
+      layoutModelId: model.id,
       sourcePage: 1,
       confidence: 0.99,
       warnings: [],
     });
-  }
-
-  if (transactions.length === 0) {
-    warnings.push('Nenhuma linha válida de transação foi encontrada na planilha/CSV.');
   }
 
   const closingBalance =
@@ -1240,17 +1612,24 @@ function parseTabularRows(
   return {
     transactions,
     pages: 1,
-    warnings,
-    bankName: detectBankName(fileName),
+    warnings: transactions.length === 0 ? ['Nenhuma linha válida de transação encontrada.'] : [],
+    bankName,
     openingBalance: null,
     closingBalance,
+    updatedModel: { ...model, totalTransactions: model.totalTransactions + transactions.length },
+    wasKnownModel: wasKnown,
+    agentNotes: [
+      wasKnown
+        ? `Layout tabular reconhecido: "${model.name}".`
+        : `Novo layout tabular memorizado: "${model.name}".`,
+    ],
   };
 }
 
 export async function parseCsvStatement(
   file: File,
   sourceId = file.name,
-  customRules: CategoryRule[] = [],
+  learnedModels: LearnedLayoutModel[] = [],
 ): Promise<ParseFileResult> {
   const text = decodeTextBuffer(await file.arrayBuffer()).replace(/^\uFEFF/, '');
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -1282,50 +1661,43 @@ export async function parseCsvStatement(
     return cells;
   };
 
-  return parseTabularRows(lines.map(parseLine), file.name, sourceId, customRules);
+  return parseTabularRows(lines.map(parseLine), file.name, sourceId, learnedModels);
 }
 
 export async function parseSpreadsheetStatement(
   file: File,
   sourceId = file.name,
-  customRules: CategoryRule[] = [],
+  learnedModels: LearnedLayoutModel[] = [],
 ): Promise<ParseFileResult> {
   const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', raw: false });
   const sheetName = workbook.SheetNames[0];
   if (!sheetName) {
-    return {
-      transactions: [],
-      pages: 1,
-      warnings: ['Planilha sem abas legíveis.'],
-      bankName: 'Extrato Bancário',
-      openingBalance: null,
-      closingBalance: null,
-    };
+    throw new Error('Planilha sem abas legíveis.');
   }
   const sheet = workbook.Sheets[sheetName];
   const rawRows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, raw: false });
   const stringRows = rawRows.map((r) => (Array.isArray(r) ? r.map((c) => String(c ?? '')) : []));
-  return parseTabularRows(stringRows, file.name, sourceId, customRules);
+  return parseTabularRows(stringRows, file.name, sourceId, learnedModels);
 }
 
 export async function parseUnifiedStatement(
   file: File,
   options: ParseFileOptions = {},
-  customRules: CategoryRule[] = [],
 ): Promise<ParseFileResult> {
   const format = detectFileFormat(file);
   const sourceId = options.sourceId ?? file.name;
+  const models = options.learnedModels ?? [];
   if (format === 'ofx') {
     options.onPage?.(1, 1);
-    return parseOfxStatement(file, sourceId, customRules);
+    return parseOfxStatement(file, sourceId, models);
   }
   if (format === 'csv') {
     options.onPage?.(1, 1);
-    return parseCsvStatement(file, sourceId, customRules);
+    return parseCsvStatement(file, sourceId, models);
   }
   if (format === 'xlsx') {
     options.onPage?.(1, 1);
-    return parseSpreadsheetStatement(file, sourceId, customRules);
+    return parseSpreadsheetStatement(file, sourceId, models);
   }
   return parseBankStatement(
     file,
@@ -1333,7 +1705,8 @@ export async function parseUnifiedStatement(
     sourceId,
     options.password,
     options.signal,
-    customRules,
+    models,
+    options.aiConfig ?? null,
   );
 }
 

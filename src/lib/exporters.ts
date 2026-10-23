@@ -56,7 +56,7 @@ export function buildWorkbook(
       ]),
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows, { cellDates: true });
-    ws['!cols'] = [{ wch: 13 }, { wch: 16 }, { wch: 16 }, { wch: 60 }];
+    ws['!cols'] = [{ wch: 13 }, { wch: 16 }, { wch: 16 }, { wch: 62 }];
     for (let r = 2; r <= transactions.length + 1; r += 1) {
       if (ws[`A${r}`]) ws[`A${r}`].z = 'dd/mm/yyyy';
       if (ws[`B${r}`] && typeof ws[`B${r}`].v === 'number') ws[`B${r}`].z = currencyFmt;
@@ -81,7 +81,6 @@ export function buildWorkbook(
         'Data',
         'Documento',
         'Histórico',
-        'Categoria',
         'Conta Contábil',
         'Débito',
         'Crédito',
@@ -103,7 +102,6 @@ export function buildWorkbook(
           toExcelDate(tx.date),
           tx.document,
           tx.history,
-          tx.category,
           tx.accountCode,
           tx.debit === 0 ? '' : tx.debit,
           tx.credit === 0 ? '' : tx.credit,
@@ -119,9 +117,8 @@ export function buildWorkbook(
     ws['!cols'] = [
       { wch: 13 },
       { wch: 15 },
-      { wch: 52 },
-      { wch: 27 },
-      { wch: 14 },
+      { wch: 56 },
+      { wch: 15 },
       { wch: 15 },
       { wch: 15 },
       { wch: 16 },
@@ -132,7 +129,7 @@ export function buildWorkbook(
     ];
     for (let r = 2; r <= transactions.length + 1; r += 1) {
       if (ws[`A${r}`]) ws[`A${r}`].z = 'dd/mm/yyyy';
-      for (const col of ['F', 'G', 'H', 'I', 'J']) {
+      for (const col of ['E', 'F', 'G', 'H', 'I']) {
         if (ws[`${col}${r}`] && typeof ws[`${col}${r}`].v === 'number') {
           ws[`${col}${r}`].z = currencyFmt;
         }
@@ -143,11 +140,11 @@ export function buildWorkbook(
     const totalCredit = transactions.reduce((sum, tx) => sum + tx.credit, 0);
     const totalNet = transactions.reduce((sum, tx) => sum + tx.amount, 0);
     ws[`A${totalRow}`] = { t: 's', v: 'TOTAL' };
-    ws[`F${totalRow}`] = { t: 'n', f: `SUM(F2:F${transactions.length + 1})`, v: totalDebit, z: currencyFmt };
-    ws[`G${totalRow}`] = { t: 'n', f: `SUM(G2:G${transactions.length + 1})`, v: totalCredit, z: currencyFmt };
-    ws[`H${totalRow}`] = { t: 'n', f: `SUM(H2:H${transactions.length + 1})`, v: totalNet, z: currencyFmt };
-    ws['!ref'] = `A1:L${totalRow}`;
-    ws['!autofilter'] = { ref: `A1:L${transactions.length + 1}` };
+    ws[`E${totalRow}`] = { t: 'n', f: `SUM(E2:E${transactions.length + 1})`, v: totalDebit, z: currencyFmt };
+    ws[`F${totalRow}`] = { t: 'n', f: `SUM(F2:F${transactions.length + 1})`, v: totalCredit, z: currencyFmt };
+    ws[`G${totalRow}`] = { t: 'n', f: `SUM(G2:G${transactions.length + 1})`, v: totalNet, z: currencyFmt };
+    ws['!ref'] = `A1:K${totalRow}`;
+    ws['!autofilter'] = { ref: `A1:K${transactions.length + 1}` };
     XLSX.utils.book_append_sheet(workbook, ws, 'Lançamentos');
   }
 
@@ -182,38 +179,7 @@ export function buildWorkbook(
   }
   XLSX.utils.book_append_sheet(workbook, monthSheet, 'Resumo Mensal');
 
-  // Aba 3: Por Categoria
-  const categoryMap = new Map<string, { count: number; credits: number; debits: number }>();
-  for (const tx of transactions) {
-    const cat = tx.category || 'Outros';
-    const cur = categoryMap.get(cat) ?? { count: 0, credits: 0, debits: 0 };
-    cur.count += 1;
-    cur.credits += tx.credit;
-    cur.debits += tx.debit;
-    categoryMap.set(cat, cur);
-  }
-  const catRows: unknown[][] = [
-    ['Categoria', 'Qtd. Lançamentos', 'Créditos', 'Débitos', 'Saldo Líquido'],
-    ...Array.from(categoryMap.entries())
-      .sort((a, b) => b[1].debits + b[1].credits - (a[1].debits + a[1].credits))
-      .map(([cat, stats]) => [
-        cat,
-        stats.count,
-        Math.round(stats.credits * 100) / 100,
-        Math.round(stats.debits * 100) / 100,
-        Math.round((stats.credits - stats.debits) * 100) / 100,
-      ]),
-  ];
-  const catSheet = XLSX.utils.aoa_to_sheet(catRows);
-  catSheet['!cols'] = [{ wch: 30 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 18 }];
-  for (let r = 2; r <= catRows.length; r += 1) {
-    for (const col of ['C', 'D', 'E']) {
-      if (catSheet[`${col}${r}`]) catSheet[`${col}${r}`].z = currencyFmt;
-    }
-  }
-  XLSX.utils.book_append_sheet(workbook, catSheet, 'Por Categoria');
-
-  // Aba 4: Conciliação Diária
+  // Aba 3: Conciliação Diária
   if (reconciliation.days.length > 0) {
     const recRows: unknown[][] = [
       [
@@ -297,7 +263,6 @@ export function buildCsvContent(transactions: Transaction[], layout: ExportLayou
             'Data',
             'Documento',
             'Histórico',
-            'Categoria',
             'Conta Contábil',
             'Débito',
             'Crédito',
@@ -309,7 +274,6 @@ export function buildCsvContent(transactions: Transaction[], layout: ExportLayou
             formatDateBr(tx.date),
             tx.document,
             tx.history,
-            tx.category,
             tx.accountCode,
             tx.debit === 0 ? '' : fmtMoney(tx.debit),
             tx.credit === 0 ? '' : fmtMoney(tx.credit),

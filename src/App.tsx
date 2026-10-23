@@ -14,26 +14,39 @@ import {
   parseUnifiedStatement,
   PasswordRequiredError,
 } from './lib/bankParser';
-import { applyRulesToTransactions, CATEGORIES, classifyTransaction } from './lib/categorizer';
 import { mergeWithSmartDedup } from './lib/dedup';
 import { downloadCsv, downloadOfx, downloadXlsx } from './lib/exporters';
+import {
+  diagnoseAndSolveDivergences,
+  exportMemoryPayload,
+  hydrateMemoryFromIndexedDb,
+  loadAiConfig,
+  loadEventsSync,
+  loadModelsSync,
+  parseImportedMemoryPayload,
+  persistMemory,
+  recordIgnoredRowInModel,
+  recordSignCorrectionInModel,
+  saveAiConfig,
+  upsertModelInList,
+} from './lib/layoutAgent';
 import { computeReconciliation } from './lib/reconciliation';
-import { buildDemoTransactions } from './lib/sampleData';
 import type {
-  CategoryRule,
+  AiProviderConfig,
   ExportLayout,
   ExportScope,
   ImportedFile,
+  LearnedLayoutModel,
+  LearningEvent,
   ProcessSummary,
   Transaction,
 } from './types';
 
 const PAGE_SIZE = 100;
-const RULES_STORAGE_KEY = 'conversor-extrato-rules-v2';
-const SESSION_STORAGE_KEY = 'conversor-extrato-session-v2';
+const SESSION_STORAGE_KEY = 'conversor-extratos-session-v3';
 
 type FilterTab = 'all' | 'attention' | 'divergent' | 'credits' | 'debits';
-type SortField = 'default' | 'date' | 'debit' | 'credit' | 'history' | 'category';
+type SortField = 'default' | 'date' | 'debit' | 'credit' | 'history';
 type SortDir = 'asc' | 'desc';
 type Theme = 'dark' | 'light';
 
@@ -99,6 +112,19 @@ function reviewConfidence(transaction: Transaction): number {
     : transaction.confidence;
 }
 
+function formatTimeShort(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return '';
+  }
+}
+
 interface MoneyInputProps {
   value: number | null;
   blankZero?: boolean;
@@ -159,6 +185,7 @@ function MoneyInput({
 
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const importMemoryInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const [theme, setTheme] = useState<Theme>(() => {
@@ -169,14 +196,20 @@ export default function App() {
     }
   });
 
-  const [customRules, setCustomRules] = useState<CategoryRule[]>(() => {
-    try {
-      const saved = localStorage.getItem(RULES_STORAGE_KEY);
-      return saved ? (JSON.parse(saved) as CategoryRule[]) : [];
-    } catch {
-      return [];
-    }
-  });
+  // Persistent Evolving AI Layout Memory (IndexedDB + localStorage)
+  const [learnedModels, setLearnedModels] = useState<LearnedLayoutModel[]>(() => loadModelsSync());
+  const [learningEvents, setLearningEvents] = useState<LearningEvent[]>(() => loadEventsSync());
+  const [aiConfig, setAiConfig] = useState<AiProviderConfig | null>(() => loadAiConfig());
+  const [aiCommand, setAiCommand] = useState('');
+
+  // External LLM config form drafts
+  const [providerDraft, setProviderDraft] = useState<AiProviderConfig['provider']>(
+    () => loadAiConfig()?.provider ?? 'gemini',
+  );
+  const [apiKeyDraft, setApiKeyDraft] = useState(() => loadAiConfig()?.apiKey ?? '');
+  const [modelNameDraft, setModelNameDraft] = useState(
+    () => loadAiConfig()?.model ?? 'gemini-2.5-flash',
+  );
 
   const [files, setFiles] = useState<ImportedFile[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>(() => {
@@ -209,8 +242,6 @@ export default function App() {
   const [processSummary, setProcessSummary] = useState<ProcessSummary | null>(null);
 
   const [filter, setFilter] = useState<FilterTab>('all');
-  const [selectedCategory, setSelectedCategory] = useState<string>('');
-  const [selectedMonth, setSelectedMonth] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortField, setSortField] = useState<SortField>('default');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
@@ -229,26 +260,16 @@ export default function App() {
   });
 
   const [columnWidths, setColumnWidths] = useState({
-    date: 126,
-    document: 105,
-    history: 390,
-    category: 195,
-    debit: 118,
-    credit: 118,
-    balance: 145,
+    date: 132,
+    document: 112,
+    history: 490,
+    debit: 128,
+    credit: 128,
+    balance: 152,
   });
 
-  // Rule form state
-  const [ruleKeyword, setRuleKeyword] = useState('');
-  const [ruleCategory, setRuleCategory] = useState<string>(CATEGORIES[0]);
-  const [ruleAccountCode, setRuleAccountCode] = useState('');
-  const [ruleReplace, setRuleReplace] = useState('');
-
-  // Batch find & replace state
   const [findText, setFindText] = useState('');
   const [replaceText, setReplaceText] = useState('');
-
-  // Password drafts per locked PDF
   const [passwordDrafts, setPasswordDrafts] = useState<Record<string, string>>({});
 
   const [cookiesAccepted, setCookiesAccepted] = useState(() => {
@@ -258,6 +279,24 @@ export default function App() {
       return true;
     }
   });
+
+  // Hydrate persistent memory from IndexedDB on boot
+  useEffect(() => {
+    void hydrateMemoryFromIndexedDb().then(({ models, events }) => {
+      if (models.length > 0) setLearnedModels(models);
+      if (events.length > 0) setLearningEvents(events);
+    });
+  }, []);
+
+  const commitMemoryUpdate = useCallback(
+    (nextModels: LearnedLayoutModel[], newEvents: LearningEvent[]) => {
+      const mergedEvents = [...newEvents, ...learningEvents].slice(0, 60);
+      setLearnedModels(nextModels);
+      setLearningEvents(mergedEvents);
+      persistMemory(nextModels, mergedEvents);
+    },
+    [learningEvents],
+  );
 
   const pushUndoSnapshot = useCallback((snapshot: Transaction[]) => {
     setUndoStack((prev) => [...prev.slice(-24), snapshot]);
@@ -299,14 +338,6 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(RULES_STORAGE_KEY, JSON.stringify(customRules));
-    } catch {
-      // Ignore storage error
-    }
-  }, [customRules]);
-
-  useEffect(() => {
-    try {
       if (transactions.length === 0) {
         localStorage.removeItem(SESSION_STORAGE_KEY);
       } else {
@@ -319,13 +350,18 @@ export default function App() {
         );
       }
     } catch {
-      // Ignore storage quota when dealing with tens of thousands of rows
+      // Ignore quota exceeded
     }
   }, [transactions, manualOpeningBalance]);
 
   const reconciliation = useMemo(
     () => computeReconciliation(transactions, manualOpeningBalance),
     [transactions, manualOpeningBalance],
+  );
+
+  const pendingAutoFixes = useMemo(
+    () => diagnoseAndSolveDivergences(transactions, reconciliation),
+    [transactions, reconciliation],
   );
 
   const hasAttention = useCallback(
@@ -341,8 +377,6 @@ export default function App() {
       if (filter === 'divergent' && !reconciliation.divergentRowIds.has(tx.id)) return false;
       if (filter === 'credits' && tx.amount <= 0) return false;
       if (filter === 'debits' && tx.amount >= 0) return false;
-      if (selectedCategory && tx.category !== selectedCategory) return false;
-      if (selectedMonth && !tx.date.startsWith(selectedMonth)) return false;
       if (columnFilters.dateFrom && tx.date < columnFilters.dateFrom) return false;
       if (columnFilters.dateTo && tx.date > columnFilters.dateTo) return false;
 
@@ -358,7 +392,6 @@ export default function App() {
           tx.date,
           tx.document,
           tx.history,
-          tx.category,
           tx.accountCode,
           tx.sourceBank,
           tx.sourceFile,
@@ -376,23 +409,19 @@ export default function App() {
 
     if (sortField === 'default') return filtered;
 
-    const sorted = [...filtered].sort((a, b) => {
+    return [...filtered].sort((a, b) => {
       let cmp = 0;
       if (sortField === 'date') cmp = a.date.localeCompare(b.date);
       else if (sortField === 'debit') cmp = a.debit - b.debit;
       else if (sortField === 'credit') cmp = a.credit - b.credit;
       else if (sortField === 'history') cmp = a.history.localeCompare(b.history, 'pt-BR');
-      else if (sortField === 'category') cmp = a.category.localeCompare(b.category, 'pt-BR');
       return sortDir === 'asc' ? cmp : -cmp;
     });
-    return sorted;
   }, [
     transactions,
     filter,
     hasAttention,
     reconciliation.divergentRowIds,
-    selectedCategory,
-    selectedMonth,
     columnFilters,
     searchQuery,
     sortField,
@@ -426,41 +455,19 @@ export default function App() {
     [transactions, hasAttention],
   );
 
-  const categoryStats = useMemo(() => {
-    const map = new Map<string, { totalAbs: number; net: number; count: number }>();
-    for (const tx of transactions) {
-      const cat = tx.category || 'Outros';
-      const entry = map.get(cat) ?? { totalAbs: 0, net: 0, count: 0 };
-      entry.totalAbs += Math.abs(tx.amount);
-      entry.net += tx.amount;
-      entry.count += 1;
-      map.set(cat, entry);
-    }
-    const items = Array.from(map.entries())
-      .map(([name, data]) => ({ name, ...data }))
-      .sort((a, b) => b.totalAbs - a.totalAbs);
-    const maxAbs = items[0]?.totalAbs ?? 1;
-    return items.map((item) => ({
-      ...item,
-      pct: Math.max(4, Math.round((item.totalAbs / maxAbs) * 100)),
-    }));
-  }, [transactions]);
-
-  const monthStats = useMemo(() => {
-    const map = new Map<string, { credits: number; debits: number; count: number }>();
-    for (const tx of transactions) {
-      const ym = tx.date.slice(0, 7);
-      if (!/^\d{4}-\d{2}$/.test(ym)) continue;
-      const entry = map.get(ym) ?? { credits: 0, debits: 0, count: 0 };
-      entry.credits += tx.credit;
-      entry.debits += tx.debit;
-      entry.count += 1;
-      map.set(ym, entry);
-    }
-    return Array.from(map.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([ym, data]) => ({ ym, ...data }));
-  }, [transactions]);
+  const totalLearnedRulesCount = useMemo(
+    () =>
+      learnedModels.reduce(
+        (sum, m) =>
+          sum +
+          m.creditKeywords.length +
+          m.debitKeywords.length +
+          m.ignoredPatterns.length +
+          m.historyReplacements.length,
+        0,
+      ),
+    [learnedModels],
+  );
 
   const toggleSort = (field: SortField) => {
     if (sortField === field) {
@@ -487,15 +494,14 @@ export default function App() {
 
   const addFiles = (candidateFiles: FileList | File[]) => {
     const selected = Array.from(candidateFiles);
-    const supported = selected.filter((file) =>
-      /\.(pdf|ofx|qfx|csv|txt|xlsx|xls)$/i.test(file.name) ||
-      file.type === 'application/pdf',
+    const supported = selected.filter(
+      (file) =>
+        /\.(pdf|ofx|qfx|csv|txt|xlsx|xls)$/i.test(file.name) ||
+        file.type === 'application/pdf',
     );
     const invalidCount = selected.length - supported.length;
     if (invalidCount > 0) {
-      setMessage(
-        `${invalidCount} arquivo(s) ignorado(s): envie arquivos PDF, OFX, CSV, TXT ou XLSX.`,
-      );
+      setMessage(`${invalidCount} arquivo(s) ignorado(s): envie PDF, OFX, CSV, TXT ou XLSX.`);
     }
 
     setFiles((current) => {
@@ -514,7 +520,7 @@ export default function App() {
       }
       if (additions.length > 0) {
         setMessage(
-          `${additions.length} arquivo(s) adicionado(s) na fila. Processamento 100% local.`,
+          `${additions.length} arquivo(s) na fila. O Agente de I.A. aplicará e salvará o aprendizado de layout automaticamente.`,
         );
       }
       return [...current, ...additions];
@@ -532,27 +538,6 @@ export default function App() {
     if (event.dataTransfer.files.length) addFiles(event.dataTransfer.files);
   };
 
-  const loadDemoData = () => {
-    pushUndoSnapshot(transactions);
-    const demo = buildDemoTransactions();
-    setManualOpeningBalance(demo.openingBalance);
-    setTransactions(demo.transactions);
-    setProcessSummary({
-      processedFiles: 1,
-      totalFiles: 1,
-      extracted: demo.transactions.length,
-      duplicatesRemoved: 0,
-      attention: demo.transactions.filter(hasAttention).length,
-      errors: 0,
-    });
-    setFilter('all');
-    setSelectedCategory('');
-    setSelectedMonth('');
-    setMessage(
-      'Extrato de demonstração carregado (10 lançamentos conciliados). Experimente editar valores, criar regras ou exportar Excel, OFX e CSV!',
-    );
-  };
-
   const clearAll = () => {
     if (processing) return;
     pushUndoSnapshot(transactions);
@@ -560,10 +545,8 @@ export default function App() {
     setTransactions([]);
     setManualOpeningBalance(null);
     setProcessSummary(null);
-    setSelectedCategory('');
-    setSelectedMonth('');
     setSearchQuery('');
-    setMessage('Mesa limpa. Você pode desfazer com "Desfazer" se limpou por engano.');
+    setMessage('Mesa limpa (os modelos de layout aprendidos pela I.A. permanecem salvos na memória).');
   };
 
   const removeFile = (id: string) => {
@@ -571,18 +554,24 @@ export default function App() {
     pushUndoSnapshot(transactions);
     setFiles((current) => current.filter((item) => item.id !== id));
     setTransactions((current) => current.filter((transaction) => transaction.sourceId !== id));
-    setMessage('Arquivo removido e lançamentos correspondentes retirados da tabela.');
+    setMessage('Arquivo removido da conferência.');
   };
 
-  const runQueue = async (targetItems: ImportedFile[]) => {
+  const runQueue = async (
+    targetItems: ImportedFile[],
+    overrideModels?: LearnedLayoutModel[],
+    replaceExistingFromSources = false,
+  ) => {
     if (!targetItems.length || processing) return;
 
     const controller = new AbortController();
     abortRef.current = controller;
     setProcessing(true);
     setProgressPct(4);
-    setMessage('Iniciando leitura adaptativa local (datas, colunas, históricos e saldos)…');
+    setMessage('Agente de I.A. analisando estrutura de colunas, datas e sinais dos extratos…');
 
+    let workingModels = [...(overrideModels ?? learnedModels)];
+    const generatedEvents: LearningEvent[] = [];
     let extracted: Transaction[] = [];
     let firstOpeningBalance: number | null = null;
     let errors = 0;
@@ -595,23 +584,30 @@ export default function App() {
       );
 
       try {
-        const result = await parseUnifiedStatement(
-          item.file,
-          {
-            sourceId: item.id,
-            password: item.password,
-            signal: controller.signal,
-            onPage: (currentPage, totalPages) => {
-              const fileBase = (index / targetItems.length) * 100;
-              const fileStep = (currentPage / Math.max(1, totalPages)) * (100 / targetItems.length);
-              setProgressPct(Math.min(98, Math.round(fileBase + fileStep)));
-              setMessage(
-                `Lendo ${item.file.name}: página ${currentPage} de ${totalPages}…`,
-              );
-            },
+        const result = await parseUnifiedStatement(item.file, {
+          sourceId: item.id,
+          password: item.password,
+          signal: controller.signal,
+          learnedModels: workingModels,
+          aiConfig,
+          onPage: (currentPage, totalPages) => {
+            const fileBase = (index / targetItems.length) * 100;
+            const fileStep = (currentPage / Math.max(1, totalPages)) * (100 / targetItems.length);
+            setProgressPct(Math.min(98, Math.round(fileBase + fileStep)));
+            setMessage(`Lendo ${item.file.name}: página ${currentPage} de ${totalPages}…`);
           },
-          customRules,
-        );
+        });
+
+        workingModels = upsertModelInList(workingModels, result.updatedModel);
+        for (const note of result.agentNotes) {
+          generatedEvents.push({
+            id: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            modelName: result.updatedModel.name,
+            kind: result.wasKnownModel ? 'matched-model' : 'new-model',
+            detail: note,
+          });
+        }
 
         extracted = [...extracted, ...result.transactions];
         if (firstOpeningBalance === null && result.openingBalance !== null) {
@@ -627,6 +623,8 @@ export default function App() {
                   transactions: result.transactions.length,
                   pages: result.pages,
                   bankName: result.bankName,
+                  matchedModelId: result.updatedModel.id,
+                  matchedModelName: result.updatedModel.name,
                   openingBalance: result.openingBalance,
                   closingBalance: result.closingBalance,
                   error: result.warnings[0],
@@ -656,13 +654,19 @@ export default function App() {
       }
     }
 
+    commitMemoryUpdate(workingModels, generatedEvents);
+
     if (extracted.length > 0 || errors > 0) {
       pushUndoSnapshot(transactions);
       if (manualOpeningBalance === null && firstOpeningBalance !== null) {
         setManualOpeningBalance(firstOpeningBalance);
       }
+      const sourceIdsToReplace = new Set(targetItems.map((i) => i.id));
       setTransactions((current) => {
-        const merged = mergeWithSmartDedup(current, extracted, removeDuplicates);
+        const base = replaceExistingFromSources
+          ? current.filter((tx) => !sourceIdsToReplace.has(tx.sourceId))
+          : current;
+        const merged = mergeWithSmartDedup(base, extracted, removeDuplicates);
         setProcessSummary({
           processedFiles: targetItems.length,
           totalFiles: files.length,
@@ -673,15 +677,13 @@ export default function App() {
         });
         setMessage(
           errors
-            ? 'Processamento concluído com alertas em algum arquivo. Confira a fila acima.'
-            : merged.duplicatesCount > 0 && removeDuplicates
-              ? `Leitura concluída: ${extracted.length} lançamento(s) lido(s) e ${merged.duplicatesCount} duplicidade(s) entre arquivos removida(s) automaticamente.`
-              : `Leitura concluída com sucesso (${extracted.length} lançamento(s)). Conciliação de saldo calculada automaticamente.`,
+            ? 'Processamento concluído com avisos. Verifique os arquivos sinalizados.'
+            : `Conversão concluída (${extracted.length} lançamentos). Modelo de layout salvo na memória evolutiva da I.A.!`,
         );
         return merged.records;
       });
     } else if (controller.signal.aborted) {
-      setMessage('Processamento interrompido pelo usuário.');
+      setMessage('Leitura cancelada pelo usuário.');
     }
 
     setProgressPct(100);
@@ -694,6 +696,11 @@ export default function App() {
     void runQueue(queue);
   };
 
+  const reprocessAllWithLearnedMemory = () => {
+    if (!files.length || processing) return;
+    void runQueue(files, learnedModels, true);
+  };
+
   const unlockAndProcessFile = (item: ImportedFile) => {
     const pwd = (passwordDrafts[item.id] ?? '').trim();
     if (!pwd) return;
@@ -704,7 +711,7 @@ export default function App() {
 
   const updateTransactionText = (
     id: string,
-    field: 'date' | 'document' | 'history' | 'category' | 'accountCode',
+    field: 'date' | 'document' | 'history' | 'accountCode',
     value: string,
   ) => {
     pushUndoSnapshot(transactions);
@@ -718,7 +725,10 @@ export default function App() {
     field: 'debit' | 'credit' | 'balance',
     next: number | null,
   ) => {
+    const targetTx = transactions.find((t) => t.id === id);
     pushUndoSnapshot(transactions);
+
+    let nextAmountForLearning: number | null = null;
     setTransactions((current) =>
       current.map((tx) => {
         if (tx.id !== id) return tx;
@@ -729,38 +739,324 @@ export default function App() {
         if (field === 'debit') {
           const newCredit = val > 0 ? 0 : tx.credit;
           const amount = Math.round((newCredit - val) * 100) / 100;
+          if (tx.amount >= 0 && amount < 0) nextAmountForLearning = amount;
           return { ...tx, debit: val, credit: newCredit, amount };
         }
         const newDebit = val > 0 ? 0 : tx.debit;
         const amount = Math.round((val - newDebit) * 100) / 100;
+        if (tx.amount <= 0 && amount > 0) nextAmountForLearning = amount;
         return { ...tx, credit: val, debit: newDebit, amount };
       }),
     );
+
+    if (targetTx && nextAmountForLearning !== null) {
+      const { models, event } = recordSignCorrectionInModel(
+        learnedModels,
+        targetTx,
+        nextAmountForLearning,
+      );
+      if (event) {
+        commitMemoryUpdate(models, [event]);
+        setMessage(`I.A. aprendeu com seu ajuste: ${event.detail}`);
+      }
+    }
   };
 
+  // Every manual flip teaches the AI layout memory automatically!
   const invertTransactionSign = (id: string) => {
+    const targetTx = transactions.find((t) => t.id === id);
+    if (!targetTx) return;
     pushUndoSnapshot(transactions);
+    const flipped = -targetTx.amount;
+
     setTransactions((current) =>
-      current.map((tx) => {
-        if (tx.id !== id) return tx;
-        const flipped = -tx.amount;
-        const classified = classifyTransaction(tx.history, flipped, customRules);
-        return {
-          ...tx,
-          amount: flipped,
-          debit: flipped < 0 ? Math.abs(flipped) : 0,
-          credit: flipped > 0 ? flipped : 0,
-          category: classified.category,
-          accountCode: classified.accountCode,
-        };
-      }),
+      current.map((tx) =>
+        tx.id === id
+          ? {
+              ...tx,
+              amount: flipped,
+              debit: flipped < 0 ? Math.abs(flipped) : 0,
+              credit: flipped > 0 ? flipped : 0,
+            }
+          : tx,
+      ),
+    );
+
+    const { models, event } = recordSignCorrectionInModel(learnedModels, targetTx, flipped);
+    if (event) {
+      commitMemoryUpdate(models, [event]);
+      setMessage(`Sinal invertido e salvo na memória da I.A.: ${event.detail}`);
+    }
+  };
+
+  // Deleting a noise/subtotal row teaches the layout model to ignore it in future uploads!
+  const deleteTransactionRow = (id: string) => {
+    const targetTx = transactions.find((t) => t.id === id);
+    pushUndoSnapshot(transactions);
+    setTransactions((current) => current.filter((tx) => tx.id !== id));
+
+    if (targetTx && targetTx.sourceId !== 'manual') {
+      const { models, event } = recordIgnoredRowInModel(learnedModels, targetTx);
+      if (event) {
+        commitMemoryUpdate(models, [event]);
+        setMessage(`Linha excluída e memorizada pela I.A.: ${event.detail}`);
+        return;
+      }
+    }
+    setMessage('Lançamento excluído (clique em "Desfazer" se desejar restaurar).');
+  };
+
+  const applyAiAutoReconcile = () => {
+    if (!pendingAutoFixes.length) {
+      setMessage('Nenhuma divergência matemática pendente para reparo automático.');
+      return;
+    }
+    pushUndoSnapshot(transactions);
+    const removeIds = new Set(
+      pendingAutoFixes.filter((f) => f.action === 'remove-noise').map((f) => f.transactionId),
+    );
+    const flipIds = new Set(
+      pendingAutoFixes.filter((f) => f.action === 'invert-sign').map((f) => f.transactionId),
+    );
+
+    let updatedModels = [...learnedModels];
+    const events: LearningEvent[] = [];
+
+    for (const fix of pendingAutoFixes) {
+      const originalTx = transactions.find((t) => t.id === fix.transactionId);
+      if (!originalTx) continue;
+      if (fix.action === 'invert-sign') {
+        const res = recordSignCorrectionInModel(updatedModels, originalTx, fix.newAmount);
+        updatedModels = res.models;
+        if (res.event) events.push(res.event);
+      } else {
+        const res = recordIgnoredRowInModel(updatedModels, originalTx);
+        updatedModels = res.models;
+        if (res.event) events.push(res.event);
+      }
+    }
+
+    setTransactions((current) =>
+      current
+        .filter((tx) => !removeIds.has(tx.id))
+        .map((tx) => {
+          if (!flipIds.has(tx.id)) return tx;
+          const flipped = -tx.amount;
+          return {
+            ...tx,
+            amount: flipped,
+            debit: flipped < 0 ? Math.abs(flipped) : 0,
+            credit: flipped > 0 ? flipped : 0,
+          };
+        }),
+    );
+
+    events.unshift({
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      modelName: updatedModels[0]?.name ?? 'Memória Geral',
+      kind: 'auto-reconcile',
+      detail: `Agente de I.A. aplicou ${pendingAutoFixes.length} correção(ões) matemática(s) conciliando os saldos diários.`,
+    });
+    commitMemoryUpdate(updatedModels, events);
+    setFilter('all');
+    setMessage(
+      `Agente de I.A. corrigiu ${pendingAutoFixes.length} lançamento(s), conciliou o saldo e salvou o aprendizado na memória!`,
     );
   };
 
-  const deleteTransactionRow = (id: string) => {
-    pushUndoSnapshot(transactions);
-    setTransactions((current) => current.filter((tx) => tx.id !== id));
-    setMessage('Lançamento excluído (clique em "Desfazer" para restaurar).');
+  // Natural-language AI Assistant handler
+  const handleAiPromptSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    const raw = aiCommand.trim();
+    if (!raw) return;
+    const lower = raw.toLocaleLowerCase('pt-BR');
+
+    // 1. Reconcile / Fix balance divergences
+    if (/(concili|corrigir?\s+diverg|ajustar?\s+saldo)/.test(lower)) {
+      applyAiAutoReconcile();
+      setAiCommand('');
+      return;
+    }
+
+    // 2. Swap debit/credit columns on learned model & reprocess
+    if (/inverter\s+colunas|trocar\s+colunas/.test(lower)) {
+      if (!learnedModels.length) {
+        setMessage('Importe um arquivo primeiro para calibrar as colunas do modelo.');
+        return;
+      }
+      const target = learnedModels[0];
+      const toggled: LearnedLayoutModel = {
+        ...target,
+        swapDebitCreditColumns: !target.swapDebitCreditColumns,
+        updatedAt: new Date().toISOString(),
+      };
+      const nextModels = upsertModelInList(learnedModels, toggled);
+      const ev: LearningEvent = {
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        modelName: toggled.name,
+        kind: 'ai-assist',
+        detail: `Ordem das colunas Débito/Crédito invertida e salva no modelo "${toggled.name}".`,
+      };
+      commitMemoryUpdate(nextModels, [ev]);
+      setAiCommand('');
+      if (files.length > 0) {
+        void runQueue(files, nextModels, true);
+      } else {
+        setMessage(ev.detail);
+      }
+      return;
+    }
+
+    // 3. Teach ignore rule: "ignorar [TERMO]" / "remover linhas com [TERMO]"
+    const ignoreMatch = raw.match(
+      /(?:ignorar?|ignore|excluir?|remover?)(?:\s+linhas?\s+(?:com|que\s+contenham?))?\s+["']?(.+?)["']?$/i,
+    );
+    if (ignoreMatch?.[1]) {
+      const pattern = ignoreMatch[1].trim().toUpperCase();
+      pushUndoSnapshot(transactions);
+      const before = transactions.length;
+      const remaining = transactions.filter((tx) => !tx.history.toUpperCase().includes(pattern));
+      setTransactions(remaining);
+
+      if (learnedModels.length > 0) {
+        const target = learnedModels[0];
+        const updated: LearnedLayoutModel = {
+          ...target,
+          ignoredPatterns: [...new Set([pattern, ...target.ignoredPatterns])],
+          updatedAt: new Date().toISOString(),
+        };
+        commitMemoryUpdate(upsertModelInList(learnedModels, updated), [
+          {
+            id: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            modelName: updated.name,
+            kind: 'learned-ignore',
+            detail: `Regra ensinada ao Agente: ignorar sempre linhas contendo "${pattern}" no modelo ${updated.name}.`,
+          },
+        ]);
+      }
+      setAiCommand('');
+      setMessage(
+        `I.A. memorizou o filtro "${pattern}" (${before - remaining.length} linha(s) removida(s) agora e filtradas automaticamente nos próximos extratos).`,
+      );
+      return;
+    }
+
+    // 4. Teach credit / debit rule: "[TERMO] é crédito/débito" or "converter [TERMO] para débito/crédito"
+    const isDebitCmd = /\bd[eé]bito\b|\bsa[ií]da\b|\bnegativo\b/i.test(lower);
+    const isCreditCmd = /\bcr[eé]dito\b|\bentrada\b|\bpositivo\b/i.test(lower);
+    if (isDebitCmd || isCreditCmd) {
+      const cleanedTerm = raw
+        .replace(
+          /\b(?:todo\s+lan[çc]amento\s+com|lan[çc]amentos?\s+com|converter|marcar|definir|deve\s+ser|[eé]|como|para|sempre|d[eé]bito|deb|cr[eé]dito|cred|sa[ií]da|entrada|negativo|positivo)\b/gi,
+          ' ',
+        )
+        .replace(/["']/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toUpperCase();
+
+      if (cleanedTerm.length >= 2) {
+        pushUndoSnapshot(transactions);
+        let count = 0;
+        setTransactions((current) =>
+          current.map((tx) => {
+            if (!tx.history.toUpperCase().includes(cleanedTerm)) return tx;
+            const abs = Math.abs(tx.amount);
+            const nextAmt = isCreditCmd ? abs : -abs;
+            if (nextAmt !== tx.amount) count += 1;
+            return {
+              ...tx,
+              amount: nextAmt,
+              debit: nextAmt < 0 ? abs : 0,
+              credit: nextAmt > 0 ? abs : 0,
+            };
+          }),
+        );
+
+        if (learnedModels.length > 0) {
+          const target = learnedModels[0];
+          const updated: LearnedLayoutModel = {
+            ...target,
+            creditKeywords: isCreditCmd
+              ? [...new Set([cleanedTerm, ...target.creditKeywords])]
+              : target.creditKeywords.filter((k) => k !== cleanedTerm),
+            debitKeywords: !isCreditCmd
+              ? [...new Set([cleanedTerm, ...target.debitKeywords])]
+              : target.debitKeywords.filter((k) => k !== cleanedTerm),
+            updatedAt: new Date().toISOString(),
+          };
+          commitMemoryUpdate(upsertModelInList(learnedModels, updated), [
+            {
+              id: crypto.randomUUID(),
+              timestamp: new Date().toISOString(),
+              modelName: updated.name,
+              kind: 'learned-sign',
+              detail: `Ensinamento salvo: "${cleanedTerm}" classificado sempre como ${
+                isCreditCmd ? 'CRÉDITO (+)' : 'DÉBITO (-)'
+              } no modelo ${updated.name}.`,
+            },
+          ]);
+        }
+        setAiCommand('');
+        setMessage(
+          `I.A. aprendeu que "${cleanedTerm}" é ${
+            isCreditCmd ? 'Crédito (+)' : 'Débito (-)'
+          } (${count} lançamento(s) ajustado(s) e salvo para próximos PDFs).`,
+        );
+        return;
+      }
+    }
+
+    // 5. Teach text replacement: "substituir X por Y"
+    const repMatch = raw.match(/substitu(?:ir|a)\s+["']?(.+?)["']?\s+por\s+["']?(.+?)["']?$/i);
+    if (repMatch?.[1]) {
+      const fromStr = repMatch[1].trim();
+      const toStr = repMatch[2]?.trim() ?? '';
+      pushUndoSnapshot(transactions);
+      const escaped = fromStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'gi');
+      let updatedCount = 0;
+      setTransactions((current) =>
+        current.map((tx) => {
+          if (!regex.test(tx.history)) return tx;
+          updatedCount += 1;
+          return {
+            ...tx,
+            history: tx.history.replace(regex, toStr).replace(/\s+/g, ' ').trim(),
+          };
+        }),
+      );
+      if (learnedModels.length > 0) {
+        const target = learnedModels[0];
+        const updated: LearnedLayoutModel = {
+          ...target,
+          historyReplacements: [
+            ...target.historyReplacements.filter((r) => r.from !== fromStr),
+            { from: fromStr, to: toStr },
+          ],
+          updatedAt: new Date().toISOString(),
+        };
+        commitMemoryUpdate(upsertModelInList(learnedModels, updated), [
+          {
+            id: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            modelName: updated.name,
+            kind: 'learned-clean',
+            detail: `Substituição automática memorizada: "${fromStr}" → "${toStr}".`,
+          },
+        ]);
+      }
+      setAiCommand('');
+      setMessage(`Padronização aplicada em ${updatedCount} linha(s) e salva na memória da I.A.`);
+      return;
+    }
+
+    setMessage(
+      'Dica do Agente de I.A.: experimente comandos como "TARIFA CESTA é débito", "RESGATE AUT é crédito", "ignorar SALDO APLIC AUT", "substituir PAGTO ELETRON por PAGAMENTO BOLETO" ou "corrigir divergências".',
+    );
   };
 
   const addManualTransaction = () => {
@@ -774,15 +1070,14 @@ export default function App() {
       id: `manual-${crypto.randomUUID()}`,
       date: defaultDate,
       document: '',
-      history: 'AJUSTE / LANÇAMENTO MANUAL',
-      category: 'Outros',
-      accountCode: '4.9.99',
+      history: 'LANÇAMENTO MANUAL',
+      accountCode: '',
       amount: 0,
       debit: 0,
       credit: 0,
       balance: null,
       sourceId: 'manual',
-      sourceFile: 'Inserção Manual',
+      sourceFile: 'Manual',
       sourceBank: 'Manual',
       sourcePage: 1,
       confidence: 0.99,
@@ -790,32 +1085,7 @@ export default function App() {
     };
     setTransactions((current) => [newTx, ...current]);
     setPage(0);
-    setMessage('Novo lançamento manual adicionado no topo para preenchimento.');
-  };
-
-  const handleAddRule = (event: FormEvent) => {
-    event.preventDefault();
-    if (!ruleKeyword.trim()) return;
-    const nextRule: CategoryRule = {
-      id: crypto.randomUUID(),
-      keyword: ruleKeyword.trim(),
-      category: ruleCategory,
-      accountCode: ruleAccountCode.trim(),
-      replaceHistory: ruleReplace.trim() || undefined,
-    };
-    const updatedRules = [nextRule, ...customRules];
-    setCustomRules(updatedRules);
-    pushUndoSnapshot(transactions);
-    setTransactions((current) => applyRulesToTransactions(current, updatedRules));
-    setRuleKeyword('');
-    setRuleAccountCode('');
-    setRuleReplace('');
-    setMessage(`Regra "${nextRule.keyword}" criada e aplicada aos lançamentos.`);
-  };
-
-  const removeRule = (id: string) => {
-    const updated = customRules.filter((r) => r.id !== id);
-    setCustomRules(updated);
+    setMessage('Novo lançamento manual adicionado.');
   };
 
   const handleBatchReplace = (event: FormEvent) => {
@@ -836,11 +1106,93 @@ export default function App() {
         };
       }),
     );
+
+    if (learnedModels.length > 0 && changed > 0) {
+      const target = learnedModels[0];
+      const updated: LearnedLayoutModel = {
+        ...target,
+        historyReplacements: [
+          ...target.historyReplacements.filter((r) => r.from !== needle),
+          { from: needle, to: replaceText },
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      commitMemoryUpdate(upsertModelInList(learnedModels, updated), [
+        {
+          id: crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+          modelName: updated.name,
+          kind: 'learned-clean',
+          detail: `Padronização "${needle}" → "${replaceText}" salva no modelo ${updated.name}.`,
+        },
+      ]);
+    }
+
     setMessage(
       changed > 0
-        ? `Histórico atualizado em ${changed} lançamento(s).`
+        ? `Histórico atualizado em ${changed} lançamento(s) e salvo na memória da I.A.`
         : `Nenhum histórico encontrado contendo "${needle}".`,
     );
+  };
+
+  const handleSaveAiProvider = (event: FormEvent) => {
+    event.preventDefault();
+    if (!apiKeyDraft.trim()) {
+      saveAiConfig(null);
+      setAiConfig(null);
+      setMessage('Conector externo removido. O Agente Neural Local permanece 100% ativo.');
+      return;
+    }
+    const cfg: AiProviderConfig = {
+      provider: providerDraft,
+      apiKey: apiKeyDraft.trim(),
+      model: modelNameDraft.trim(),
+    };
+    saveAiConfig(cfg);
+    setAiConfig(cfg);
+    setMessage(`Conector ${cfg.provider.toUpperCase()} salvo localmente no navegador.`);
+  };
+
+  const handleExportMemory = () => {
+    const json = exportMemoryPayload(learnedModels, learningEvents);
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'memoria-ia-conversor-extratos.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  };
+
+  const handleImportMemory = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const raw = await file.text();
+      const imported = parseImportedMemoryPayload(raw);
+      let merged = [...learnedModels];
+      for (const m of imported.models) {
+        merged = upsertModelInList(merged, m);
+      }
+      commitMemoryUpdate(merged, [
+        {
+          id: crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+          modelName: 'Memória Importada',
+          kind: 'ai-assist',
+          detail: `${imported.models.length} modelo(s) de layout importado(s) com sucesso.`,
+        },
+      ]);
+      setMessage(`${imported.models.length} modelo(s) de layout carregado(s) na memória da I.A.`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Falha ao importar memória JSON.');
+    }
+  };
+
+  const removeLearnedModel = (id: string) => {
+    const remaining = learnedModels.filter((m) => m.id !== id);
+    commitMemoryUpdate(remaining, []);
+    setMessage('Modelo removido da memória da I.A.');
   };
 
   const getExportTarget = (): Transaction[] | null => {
@@ -864,11 +1216,7 @@ export default function App() {
     const target = getExportTarget();
     if (!target) return;
     downloadXlsx(target, reconciliation, exportLayout);
-    setMessage(
-      exportLayout === 'completo'
-        ? `Planilha Excel exportada com 4 abas (${target.length} lançamentos, Resumo Mensal, Categorias e Conciliação Diária).`
-        : `Planilha Contábil Excel exportada (${target.length} lançamentos + Resumo Mensal, Categorias e Conciliação).`,
-    );
+    setMessage(`Planilha Excel exportada (${target.length} lançamentos).`);
   };
 
   const handleExportCsv = () => {
@@ -882,9 +1230,7 @@ export default function App() {
     const target = getExportTarget();
     if (!target) return;
     downloadOfx(target, reconciliation);
-    setMessage(
-      `Arquivo OFX universal gerado (${target.length} lançamentos) — pronto para Domínio, Alterdata, Conta Azul, Omie ou Fortes.`,
-    );
+    setMessage(`Arquivo OFX gerado (${target.length} lançamentos).`);
   };
 
   return (
@@ -899,14 +1245,13 @@ export default function App() {
           <span>
             Conversor de <strong>Extratos</strong>
           </span>
-          <span className="version-pill">v2.0</span>
         </a>
 
         <div className="topbar-right">
-          <span className="privacy-chip">
+          <a className="ai-status-chip" href="#agente-ia">
             <i className="pulse" aria-hidden="true" />
-            100% Local · Privacidade Total
-          </span>
+            I.A. Evolutiva · {learnedModels.length} modelo{learnedModels.length === 1 ? '' : 's'} salvo{learnedModels.length === 1 ? '' : 's'}
+          </a>
           {undoStack.length > 0 && (
             <button
               className="theme-toggle"
@@ -931,50 +1276,7 @@ export default function App() {
         </div>
       </header>
 
-      <section className="hero" id="inicio">
-        <div className="eyebrow">
-          <span aria-hidden="true" />
-          Conversor &amp; Conciliador Contábil
-        </div>
-        <h1>
-          Conversor de <em>Extratos</em>
-        </h1>
-        <p>
-          Importe extratos em PDF (nativos, protegidos por senha ou escaneados via OCR), OFX, CSV e
-          planilhas de qualquer banco brasileiro, audite a conciliação diária de saldos, categorize
-          automaticamente e exporte para <strong>Excel</strong>, <strong>OFX</strong> e{' '}
-          <strong>CSV</strong> sem enviar nenhum dado a servidores externos.
-        </p>
-
-        <div className="bank-pills" aria-label="Bancos e formatos compatíveis">
-          <span>Caixa</span>
-          <span>Banco do Brasil</span>
-          <span>Itaú</span>
-          <span>Bradesco</span>
-          <span>Santander</span>
-          <span>Nubank</span>
-          <span>Inter</span>
-          <span>Sicoob / Sicredi</span>
-          <span>C6 / Cora / BTG</span>
-          <span>PDF · OFX · CSV · XLSX</span>
-        </div>
-
-        <div className="flow-line" aria-label="Fluxo de três etapas">
-          <span>
-            <b>01</b> Importar PDFs, OFX ou CSV
-          </span>
-          <i />
-          <span>
-            <b>02</b> Conciliar saldos e categorizar
-          </span>
-          <i />
-          <span>
-            <b>03</b> Exportar Excel, OFX ou CSV
-          </span>
-        </div>
-      </section>
-
-      <section className="workspace" aria-label="Conversor de extratos">
+      <section className="workspace" id="inicio" aria-label="Importação de extratos">
         <div className="workspace-title">
           <div>
             <span className="section-index">01</span>
@@ -1004,14 +1306,11 @@ export default function App() {
           <div className="drop-copy">
             <h3>Solte os extratos aqui (PDF, OFX, CSV ou XLSX)</h3>
             <p>
-              Consolide vários meses ou bancos em uma única conferência, com reconstrução automática
-              de históricos multilinhas, remoção inteligente de duplicidades e conciliação diária.
+              Cada layout processado é catalogado automaticamente pela I.A. para aperfeiçoar
+              conversões futuras.
             </p>
           </div>
           <div className="drop-actions">
-            <button className="button secondary" type="button" onClick={loadDemoData}>
-              Testar com exemplo
-            </button>
             <button
               className="button primary"
               type="button"
@@ -1052,7 +1351,11 @@ export default function App() {
                 <div className="file-meta">
                   <div className="file-meta-top">
                     <strong>{item.file.name}</strong>
-                    {item.bankName && <span className="bank-badge">{item.bankName}</span>}
+                    {item.matchedModelName ? (
+                      <span className="bank-badge">{item.matchedModelName}</span>
+                    ) : (
+                      item.bankName && <span className="bank-badge">{item.bankName}</span>
+                    )}
                   </div>
                   <span>
                     {(item.file.size / 1024 / 1024).toFixed(2)} MB
@@ -1124,7 +1427,7 @@ export default function App() {
                 ? `${readyFiles.length} arquivo(s) pronto(s) para processar`
                 : completeFiles.length
                   ? 'Todos os arquivos da fila foram processados'
-                  : 'Adicione PDFs, OFX, CSV ou clique em "Testar com exemplo"'}
+                  : 'Adicione um ou mais arquivos de extrato'}
             </strong>
             <label className="dedup-toggle">
               <input
@@ -1146,6 +1449,15 @@ export default function App() {
                 Cancelar leitura
               </button>
             )}
+            {files.length > 0 && !processing && (
+              <button
+                className="button secondary"
+                type="button"
+                onClick={reprocessAllWithLearnedMemory}
+              >
+                Reprocessar com memória da I.A.
+              </button>
+            )}
             {(files.length > 0 || transactions.length > 0) && !processing && (
               <button className="button ghost" type="button" onClick={clearAll}>
                 Limpar mesa
@@ -1161,6 +1473,193 @@ export default function App() {
             </button>
           </div>
         </div>
+      </section>
+
+      {/* Evolutionary AI Layout Agent Section */}
+      <section
+        className="ai-agent-card"
+        id="agente-ia"
+        aria-labelledby="ai-agent-heading"
+      >
+        <div className="workspace-title">
+          <div>
+            <span className="section-index">I.A.</span>
+            <h2 id="ai-agent-heading">Agente de I.A. &amp; Memória Evolutiva de Layouts</h2>
+          </div>
+          <span className="file-counter">
+            {learnedModels.length} layout{learnedModels.length === 1 ? '' : 's'} aprendido
+            {learnedModels.length === 1 ? '' : 's'} · {totalLearnedRulesCount} regra
+            {totalLearnedRulesCount === 1 ? '' : 's'} ativa{totalLearnedRulesCount === 1 ? '' : 's'}
+          </span>
+        </div>
+
+        <form className="ai-prompt-form" onSubmit={handleAiPromptSubmit}>
+          <input
+            aria-label="Instruir Agente de I.A."
+            placeholder='Ensine ou peça ajustes ao Agente (ex.: "TARIFA CESTA é débito", "RESGATE AUT é crédito", "ignorar SALDO APLIC AUT", "inverter colunas")…'
+            value={aiCommand}
+            onChange={(e) => setAiCommand(e.target.value)}
+          />
+          <button type="submit" className="button primary">
+            Aplicar e ensinar I.A.
+          </button>
+        </form>
+
+        <div className="ai-quick-actions">
+          {pendingAutoFixes.length > 0 && (
+            <button
+              type="button"
+              className="chip-action"
+              onClick={applyAiAutoReconcile}
+              style={{ borderColor: 'var(--warning)', color: 'var(--warning)' }}
+            >
+              ⚡ Auto-corrigir {pendingAutoFixes.length} divergência(s) matemática(s) com I.A.
+            </button>
+          )}
+          <button
+            type="button"
+            className="chip-action"
+            onClick={() => setAiCommand('corrigir divergências')}
+          >
+            Auditar saldos diários
+          </button>
+          <button
+            type="button"
+            className="chip-action"
+            onClick={() => setAiCommand('inverter colunas')}
+          >
+            Inverter colunas Débito/Crédito deste layout
+          </button>
+          <button type="button" className="chip-action" onClick={handleExportMemory}>
+            Exportar memória (.json)
+          </button>
+          <button
+            type="button"
+            className="chip-action"
+            onClick={() => importMemoryInputRef.current?.click()}
+          >
+            Importar memória (.json)
+          </button>
+          <input
+            ref={importMemoryInputRef}
+            className="visually-hidden"
+            type="file"
+            accept="application/json,.json"
+            onChange={handleImportMemory}
+          />
+        </div>
+
+        <div className="ai-grid">
+          <div className="ai-box">
+            <div className="ai-box-header">
+              <strong>Modelos de Layout Salvos ({learnedModels.length})</strong>
+            </div>
+
+            {learnedModels.length === 0 ? (
+              <p className="empty-hint">
+                Nenhum extrato processado ainda. Ao importar qualquer extrato, o Agente identifica
+                colunas, formato de data e sinais, salvando o modelo aqui e evoluindo a cada ajuste
+                feito na tabela.
+              </p>
+            ) : (
+              <div className="model-list">
+                {learnedModels.map((model) => (
+                  <div className="model-item" key={model.id}>
+                    <div className="model-item-main">
+                      <strong>{model.name}</strong>
+                      <small>
+                        Visto {model.timesSeen}x · {model.totalTransactions} lançamentos · Precisão{' '}
+                        {model.accuracyScore}% · Data {model.dateStyle}
+                      </small>
+                      {(model.creditKeywords.length > 0 ||
+                        model.debitKeywords.length > 0 ||
+                        model.ignoredPatterns.length > 0) && (
+                        <small style={{ color: 'var(--accent)' }}>
+                          +{model.creditKeywords.length} créd. · -{model.debitKeywords.length} déb.{' '}
+                          · {model.ignoredPatterns.length} filtro(s) de ruído
+                        </small>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      title={`Remover modelo ${model.name}`}
+                      aria-label={`Remover modelo ${model.name}`}
+                      onClick={() => removeLearnedModel(model.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="ai-box">
+            <div className="ai-box-header">
+              <strong>Histórico de Aprendizado Contínuo</strong>
+            </div>
+
+            {learningEvents.length === 0 ? (
+              <p className="empty-hint">
+                Sempre que você inverter o sinal (⇄), excluir um cabeçalho/subtotal (×) ou ensinar
+                uma regra, a I.A. registrará o aprendizado aqui para aplicar automaticamente nos
+                próximos arquivos do mesmo banco.
+              </p>
+            ) : (
+              <div className="event-feed">
+                {learningEvents.slice(0, 12).map((ev) => (
+                  <div className="event-row" key={ev.id}>
+                    <time>{formatTimeShort(ev.timestamp)}</time>
+                    {ev.detail}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <details className="panel-drawer" style={{ margin: '14px 0 0' }}>
+          <summary>
+            <span>Conectar API de I.A. Generativa Externa Opcional (Gemini / OpenAI / OpenRouter)</span>
+            <span>{aiConfig?.apiKey ? `Conectado (${aiConfig.provider.toUpperCase()})` : 'Opcional'}</span>
+          </summary>
+          <div className="drawer-body">
+            <form className="inline-form-row" onSubmit={handleSaveAiProvider}>
+              <label style={{ flex: '0 1 170px' }}>
+                Provedor
+                <select
+                  value={providerDraft}
+                  onChange={(e) => setProviderDraft(e.target.value as AiProviderConfig['provider'])}
+                >
+                  <option value="gemini">Google Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="openrouter">OpenRouter</option>
+                </select>
+              </label>
+              <label style={{ flex: '0 1 210px' }}>
+                Modelo
+                <input
+                  placeholder="gemini-2.5-flash"
+                  value={modelNameDraft}
+                  onChange={(e) => setModelNameDraft(e.target.value)}
+                />
+              </label>
+              <label>
+                Chave de API (guardada apenas neste navegador)
+                <input
+                  type="password"
+                  placeholder="Cole sua API Key para PDFs atípicos sem estrutura tabular…"
+                  value={apiKeyDraft}
+                  onChange={(e) => setApiKeyDraft(e.target.value)}
+                />
+              </label>
+              <button type="submit" className="button secondary small">
+                Salvar configuração
+              </button>
+            </form>
+          </div>
+        </details>
       </section>
 
       {transactions.length > 0 && (
@@ -1179,7 +1678,7 @@ export default function App() {
                 onChange={(e) => setExportLayout(e.target.value as ExportLayout)}
               >
                 <option value="contabil">Modelo Contábil (Data · Débito · Crédito · Histórico)</option>
-                <option value="completo">Auditoria Completa (12 colunas + 4 abas)</option>
+                <option value="completo">Auditoria Completa (11 colunas + 3 abas)</option>
               </select>
 
               {filteredTransactions.length !== transactions.length && (
@@ -1268,7 +1767,7 @@ export default function App() {
                 <strong className="mono">—</strong>
               )}
               <div className="opening-row">
-                <label htmlFor="opening-balance-input">Saldo inicial:</label>
+                <label>Saldo inicial:</label>
                 <MoneyInput
                   value={reconciliation.inferredOpeningBalance}
                   allowNegative
@@ -1280,141 +1779,24 @@ export default function App() {
             </div>
           </div>
 
-          {/* Analytics & Category Breakdown Drawer */}
-          <details className="panel-drawer" open>
-            <summary>
-              <span>
-                Resumo por Categoria e Competência (clique em qualquer barra ou mês para filtrar)
-              </span>
-              <span>
-                {selectedCategory || selectedMonth ? 'Filtro ativo — clique novamente para limpar' : 'Expandir / Recolher'}
-              </span>
-            </summary>
-            <div className="drawer-body insights-grid">
-              <div className="cat-bars">
-                {categoryStats.slice(0, 7).map((cat) => (
-                  <button
-                    key={cat.name}
-                    type="button"
-                    className={`cat-bar-item ${selectedCategory === cat.name ? 'active' : ''}`}
-                    onClick={() => {
-                      setSelectedCategory((cur) => (cur === cat.name ? '' : cat.name));
-                      setPage(0);
-                    }}
-                  >
-                    <span>
-                      {cat.name} ({cat.count})
-                    </span>
-                    <span className="cat-bar-track">
-                      <span className="cat-bar-fill" style={{ width: `${cat.pct}%` }} />
-                    </span>
-                    <span className={`mono ${cat.net >= 0 ? 'positive' : 'negative'}`}>
-                      {amountLabel(cat.net)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-
-              <div className="month-cards">
-                {monthStats.map((m) => (
-                  <button
-                    key={m.ym}
-                    type="button"
-                    className={`month-card ${selectedMonth === m.ym ? 'active' : ''}`}
-                    onClick={() => {
-                      setSelectedMonth((cur) => (cur === m.ym ? '' : m.ym));
-                      setPage(0);
-                    }}
-                  >
-                    <strong>{m.ym}</strong>
-                    <small className="positive">+ {amountLabel(m.credits)}</small>
-                    <small className="negative">- {amountLabel(m.debits)}</small>
-                    <small>{m.count} lançamentos</small>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </details>
-
-          {/* Accounting Rules & Batch Replace Drawer */}
+          {/* Batch Find/Replace & Column Sizing Drawers */}
           <details className="panel-drawer">
             <summary>
-              <span>Regras Automáticas de Categorização / Plano de Contas &amp; Edição em Lote</span>
-              <span>{customRules.length} regra(s) salva(s)</span>
+              <span>Padronizar Histórico em Lote &amp; Ajustar Colunas</span>
+              <span>Configurar</span>
             </summary>
-            <div className="drawer-body" style={{ display: 'grid', gap: '16px' }}>
-              <form className="inline-form-row" onSubmit={handleAddRule}>
-                <label>
-                  Se histórico contiver
-                  <input
-                    placeholder="Ex.: ENERGISA, CONTABILIDADE, CIELO"
-                    value={ruleKeyword}
-                    onChange={(e) => setRuleKeyword(e.target.value)}
-                  />
-                </label>
-                <label>
-                  Definir Categoria
-                  <select
-                    value={ruleCategory}
-                    onChange={(e) => setRuleCategory(e.target.value)}
-                  >
-                    {CATEGORIES.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label style={{ flex: '0 1 135px' }}>
-                  Conta Contábil
-                  <input
-                    placeholder="Ex.: 4.1.03"
-                    value={ruleAccountCode}
-                    onChange={(e) => setRuleAccountCode(e.target.value)}
-                  />
-                </label>
-                <label>
-                  Padronizar Histórico (opcional)
-                  <input
-                    placeholder="Ex.: PAGTO ENERGIA ELÉTRICA"
-                    value={ruleReplace}
-                    onChange={(e) => setRuleReplace(e.target.value)}
-                  />
-                </label>
-                <button type="submit" className="button primary small">
-                  Salvar e aplicar regra
-                </button>
-              </form>
-
-              {customRules.length > 0 && (
-                <div className="rules-list">
-                  {customRules.map((rule) => (
-                    <span key={rule.id} className="rule-chip">
-                      &ldquo;{rule.keyword}&rdquo; → {rule.category}
-                      {rule.accountCode ? ` [${rule.accountCode}]` : ''}
-                      <button
-                        type="button"
-                        aria-label={`Remover regra ${rule.keyword}`}
-                        onClick={() => removeRule(rule.id)}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-
+            <div className="drawer-body" style={{ display: 'grid', gap: '14px' }}>
               <form className="inline-form-row" onSubmit={handleBatchReplace}>
                 <label>
-                  Localizar no histórico (lote)
+                  Localizar no histórico
                   <input
-                    placeholder="Texto a localizar em todas as linhas"
+                    placeholder="Trecho a localizar em todas as linhas"
                     value={findText}
                     onChange={(e) => setFindText(e.target.value)}
                   />
                 </label>
                 <label>
-                  Substituir por
+                  Substituir por (também ensina a I.A.)
                   <input
                     placeholder="Deixe vazio para remover o trecho"
                     value={replaceText}
@@ -1425,31 +1807,22 @@ export default function App() {
                   Substituir em lote
                 </button>
               </form>
-            </div>
-          </details>
 
-          {/* Column Resize & Display Settings Drawer */}
-          <details className="panel-drawer">
-            <summary>
-              <span>Ajustar largura das colunas e exibição contábil</span>
-              <span>Configurar tabela</span>
-            </summary>
-            <div className="drawer-body" style={{ display: 'grid', gap: '12px' }}>
               <label className="dedup-toggle">
                 <input
                   type="checkbox"
                   checked={showAccountCode}
                   onChange={(e) => setShowAccountCode(e.target.checked)}
                 />
-                Exibir coluna editável &ldquo;Conta Contábil&rdquo; na grade de revisão
+                Exibir coluna editável &ldquo;Conta Contábil&rdquo; na tabela
               </label>
+
               <div className="resize-grid">
                 {(
                   [
                     ['date', 'Data'],
                     ['document', 'Documento'],
                     ['history', 'Histórico'],
-                    ['category', 'Categoria'],
                     ['debit', 'Débito'],
                     ['credit', 'Crédito'],
                     ['balance', 'Saldo PDF'],
@@ -1460,7 +1833,7 @@ export default function App() {
                     <input
                       type="range"
                       min={85}
-                      max={620}
+                      max={680}
                       value={columnWidths[col]}
                       onChange={(e) =>
                         setColumnWidths((cur) => ({ ...cur, [col]: Number(e.target.value) }))
@@ -1472,7 +1845,6 @@ export default function App() {
             </div>
           </details>
 
-          {/* Filter Bar */}
           <div className="review-toolbar">
             <div className="filter-switch" role="group" aria-label="Filtrar lançamentos">
               <button
@@ -1528,14 +1900,12 @@ export default function App() {
             </div>
 
             <div className="toolbar-right-actions">
-              {(selectedCategory || selectedMonth || searchQuery || filter !== 'all') && (
+              {(searchQuery || filter !== 'all') && (
                 <button
                   type="button"
                   className="button ghost small"
                   onClick={() => {
                     setFilter('all');
-                    setSelectedCategory('');
-                    setSelectedMonth('');
                     setSearchQuery('');
                     setColumnFilters({
                       dateFrom: '',
@@ -1562,14 +1932,14 @@ export default function App() {
 
           <div className="column-tools">
             <label>
-              Busca global rápida
+              Busca rápida
               <input
                 value={searchQuery}
                 onChange={(e) => {
                   setSearchQuery(e.target.value);
                   setPage(0);
                 }}
-                placeholder="Histórico, doc., valor, banco ou categoria…"
+                placeholder="Histórico, documento, valor ou banco…"
               />
             </label>
             <label>
@@ -1635,7 +2005,6 @@ export default function App() {
                 <col style={{ width: columnWidths.date }} />
                 <col style={{ width: columnWidths.document }} />
                 <col style={{ width: columnWidths.history }} />
-                <col style={{ width: columnWidths.category }} />
                 {showAccountCode && <col style={{ width: 105 }} />}
                 <col style={{ width: columnWidths.debit }} />
                 <col style={{ width: columnWidths.credit }} />
@@ -1657,15 +2026,6 @@ export default function App() {
                       onClick={() => toggleSort('history')}
                     >
                       Histórico {sortField === 'history' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
-                    </button>
-                  </th>
-                  <th>
-                    <button
-                      type="button"
-                      className="sort-btn"
-                      onClick={() => toggleSort('category')}
-                    >
-                      Categoria {sortField === 'category' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
                     </button>
                   </th>
                   {showAccountCode && <th>Conta</th>}
@@ -1727,19 +2087,6 @@ export default function App() {
                         />
                         {warnings[0] && <small title={warnings.join(' ')}>{warnings[0]}</small>}
                       </td>
-                      <td>
-                        <select
-                          aria-label="Categoria"
-                          value={tx.category || 'Outros'}
-                          onChange={(e) => updateTransactionText(tx.id, 'category', e.target.value)}
-                        >
-                          {CATEGORIES.map((cat) => (
-                            <option key={cat} value={cat}>
-                              {cat}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
                       {showAccountCode && (
                         <td>
                           <input
@@ -1799,7 +2146,7 @@ export default function App() {
                           <button
                             type="button"
                             className="icon-button swap-sign"
-                            title="Inverter Débito ⇄ Crédito"
+                            title="Inverter Débito ⇄ Crédito (ensina a I.A.)"
                             aria-label="Inverter sinal entre Débito e Crédito"
                             onClick={() => invertTransactionSign(tx.id)}
                           >
@@ -1808,7 +2155,7 @@ export default function App() {
                           <button
                             type="button"
                             className="icon-button"
-                            title="Excluir lançamento"
+                            title="Excluir linha (ensina a I.A. a ignorar ruído)"
                             aria-label="Excluir lançamento"
                             onClick={() => deleteTransactionRow(tx.id)}
                           >
@@ -1858,10 +2205,10 @@ export default function App() {
 
       {!cookiesAccepted && (
         <aside className="cookie-notice" role="dialog" aria-label="Aviso de armazenamento local">
-          <strong>Privacidade &amp; Armazenamento Local</strong>
+          <strong>Memória Local da I.A.</strong>
           <span>
-            Usamos apenas armazenamento local do seu navegador para salvar tema, regras contábeis e
-            rascunho da conferência. Nenhum arquivo é enviado à internet.
+            Usamos apenas armazenamento local do seu navegador (IndexedDB / LocalStorage) para
+            salvar o aprendizado evolutivo dos layouts e sua conferência.
           </span>
           <button type="button" className="button primary" onClick={acceptCookies}>
             Entendi

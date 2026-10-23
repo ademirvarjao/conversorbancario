@@ -9,6 +9,8 @@ export interface ImportedFile {
   transactions: number;
   pages?: number;
   bankName?: string;
+  matchedModelId?: string;
+  matchedModelName?: string;
   openingBalance?: number | null;
   closingBalance?: number | null;
   password?: string;
@@ -20,7 +22,6 @@ export interface Transaction {
   date: string;
   document: string;
   history: string;
-  category: string;
   accountCode: string;
   amount: number;
   debit: number;
@@ -29,6 +30,7 @@ export interface Transaction {
   sourceId: string;
   sourceFile: string;
   sourceBank?: string;
+  layoutModelId?: string;
   sourcePage: number;
   occurrenceInSource?: number;
   confidence: number;
@@ -36,12 +38,53 @@ export interface Transaction {
   isDuplicate?: boolean;
 }
 
-export interface CategoryRule {
+export interface LearnedColumns {
+  dateX?: number;
+  debitX?: number;
+  creditX?: number;
+  amountX?: number;
+  balanceX?: number;
+  maxLineGapY?: number;
+}
+
+export interface HistoryReplacementRule {
+  from: string;
+  to: string;
+}
+
+export interface LearnedLayoutModel {
   id: string;
-  keyword: string;
-  category: string;
-  accountCode: string;
-  replaceHistory?: string;
+  fingerprint: string;
+  name: string;
+  bankName: string;
+  headerTokens: string[];
+  dateStyle: 'DD/MM/YYYY' | 'DD/MM' | 'WRITTEN_PT' | 'ISO' | 'MIXED';
+  signStyle: 'DC_SUFFIX' | 'PAREN_SIGN' | 'TRAILING_MINUS' | 'LEADING_SIGN' | 'DUAL_COLUMNS' | 'BALANCE_INFERRED';
+  columns: LearnedColumns;
+  creditKeywords: string[];
+  debitKeywords: string[];
+  ignoredPatterns: string[];
+  historyReplacements: HistoryReplacementRule[];
+  swapDebitCreditColumns?: boolean;
+  timesSeen: number;
+  totalTransactions: number;
+  accuracyScore: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LearningEvent {
+  id: string;
+  timestamp: string;
+  modelName: string;
+  kind: 'new-model' | 'matched-model' | 'learned-sign' | 'learned-ignore' | 'learned-clean' | 'auto-reconcile' | 'ai-assist';
+  detail: string;
+}
+
+export interface AiProviderConfig {
+  provider: 'gemini' | 'openai' | 'openrouter';
+  apiKey: string;
+  model: string;
 }
 
 export interface ParseFileOptions {
@@ -49,6 +92,8 @@ export interface ParseFileOptions {
   sourceId?: string;
   password?: string;
   signal?: AbortSignal;
+  learnedModels?: LearnedLayoutModel[];
+  aiConfig?: AiProviderConfig | null;
 }
 
 export interface ParseFileResult {
@@ -58,6 +103,9 @@ export interface ParseFileResult {
   bankName: string;
   openingBalance: number | null;
   closingBalance: number | null;
+  updatedModel: LearnedLayoutModel;
+  wasKnownModel: boolean;
+  agentNotes: string[];
 }
 
 export interface ProcessSummary {
@@ -95,6 +143,16 @@ export interface ReconciliationSummary {
   endOfDayRowIds: Set<string>;
   divergentRowIds: Set<string>;
   dayDeltaByRowId: Record<string, number>;
+}
+
+export interface AutoRepairFix {
+  transactionId: string;
+  action: 'invert-sign' | 'remove-noise';
+  date: string;
+  history: string;
+  oldAmount: number;
+  newAmount: number;
+  reason: string;
 }
 
 export type ExportLayout = 'contabil' | 'completo';

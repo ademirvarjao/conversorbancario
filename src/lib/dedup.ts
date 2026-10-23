@@ -23,7 +23,6 @@ export function transactionBaseSignature(transaction: Transaction): string {
 export function fallbackSignature(transaction: Transaction): string {
   return [
     transaction.date,
-    transaction.document.trim(),
     transaction.amount.toFixed(2),
     canonicalHistory(transaction.history),
   ].join('|');
@@ -44,18 +43,17 @@ export function mergeWithSmartDedup(
   incoming: Transaction[],
   removeDuplicates = true,
 ): { records: Transaction[]; duplicatesCount: number } {
+  const stampedExisting = stampSourceOccurrences(existing);
   const stampedIncoming = stampSourceOccurrences(incoming);
 
-  // Within existing list, register every unique (signature + intra-file occurrence index)
-  const seenKeys = new Set<string>();
-  const registerTx = (tx: Transaction) => {
-    const occ = tx.occurrenceInSource ?? 1;
-    seenKeys.add(`${transactionBaseSignature(tx)}#${occ}`);
-    seenKeys.add(`fb:${fallbackSignature(tx)}#${occ}`);
-  };
+  const seenStrict = new Set<string>();
+  const seenLoose = new Map<string, string>(); // key -> document number if present
 
-  for (const tx of existing) {
-    if (!tx.isDuplicate) registerTx(tx);
+  for (const tx of stampedExisting) {
+    if (tx.isDuplicate) continue;
+    const occ = tx.occurrenceInSource ?? 1;
+    seenStrict.add(`${transactionBaseSignature(tx)}#${occ}`);
+    seenLoose.set(`${fallbackSignature(tx)}#${occ}`, tx.document.trim());
   }
 
   let duplicatesCount = 0;
@@ -64,8 +62,18 @@ export function mergeWithSmartDedup(
   for (const tx of stampedIncoming) {
     const occ = tx.occurrenceInSource ?? 1;
     const strictKey = `${transactionBaseSignature(tx)}#${occ}`;
-    const looseKey = `fb:${fallbackSignature(tx)}#${occ}`;
-    const isDup = seenKeys.has(strictKey) || seenKeys.has(looseKey);
+    const looseKey = `${fallbackSignature(tx)}#${occ}`;
+    const existingDoc = seenLoose.get(looseKey);
+    const incomingDoc = tx.document.trim();
+
+    const conflictExplicitDocs =
+      existingDoc !== undefined &&
+      existingDoc.length > 0 &&
+      incomingDoc.length > 0 &&
+      existingDoc !== incomingDoc;
+
+    const isDup =
+      seenStrict.has(strictKey) || (seenLoose.has(looseKey) && !conflictExplicitDocs);
 
     if (isDup) {
       duplicatesCount += 1;
@@ -73,17 +81,22 @@ export function mergeWithSmartDedup(
         processedIncoming.push({
           ...tx,
           isDuplicate: true,
-          warnings: [...new Set([...tx.warnings, 'Possível duplicidade entre períodos/arquivos sobrepostos.'])],
+          warnings: [
+            ...new Set([
+              ...tx.warnings,
+              'Possível duplicidade entre períodos/arquivos sobrepostos.',
+            ]),
+          ],
         });
       }
     } else {
-      seenKeys.add(strictKey);
-      seenKeys.add(looseKey);
+      seenStrict.add(strictKey);
+      seenLoose.set(looseKey, incomingDoc);
       processedIncoming.push({ ...tx, isDuplicate: false });
     }
   }
 
-  const combined = [...existing, ...processedIncoming].sort(
+  const combined = [...stampedExisting, ...processedIncoming].sort(
     (a, b) =>
       a.date.localeCompare(b.date) ||
       a.sourceFile.localeCompare(b.sourceFile) ||
