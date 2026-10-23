@@ -39,5 +39,5 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`ExtratoFácil v2.0 publicado e ativo em http://0.0.0.0:${PORT}`);
+  console.log(`Conversor de Extratos publicado e ativo em http://0.0.0.0:${PORT}`);
 });

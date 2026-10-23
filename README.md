@@ -1,4 +1,4 @@
-# ExtratoFácil v2.0 — Conversor e Conciliador de Extrato Bancário
+# Conversor de Extratos
 
 Ferramenta web 100% client-side (processamento integral no navegador, **zero envio de arquivos a servidores**) para converter, conciliar, categorizar e auditar extratos bancários brasileiros em **PDF** (texto nativo, protegidos por senha ou digitalizados via OCR), **OFX**, **CSV**, **TXT** e **XLSX**.
 

@@ -897,7 +897,7 @@ export default function App() {
             <i />
           </span>
           <span>
-            Extrato<strong>Fácil</strong>
+            Conversor de <strong>Extratos</strong>
           </span>
           <span className="version-pill">v2.0</span>
         </a>
@@ -937,7 +937,7 @@ export default function App() {
           Conversor &amp; Conciliador Contábil
         </div>
         <h1>
-          Conversor de Extrato <em>Bancário</em>
+          Conversor de <em>Extratos</em>
         </h1>
         <p>
           Importe extratos em PDF (nativos, protegidos por senha ou escaneados via OCR), OFX, CSV e
@@ -1853,7 +1853,7 @@ export default function App() {
       )}
 
       <footer>
-        Feito por Ademir Varjão · ExtratoFácil v2.0 — Processamento 100% local no navegador
+        Feito por Ademir Varjão · Conversor de Extratos — Processamento 100% local no navegador
       </footer>
 
       {!cookiesAccepted && (

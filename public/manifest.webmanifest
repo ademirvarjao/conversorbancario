@@ -1,7 +1,7 @@
 {
-  "name": "ExtratoFácil — Conversor de Extrato Bancário",
-  "short_name": "ExtratoFácil",
-  "description": "Conversor e conciliador local de extratos bancários em PDF, OFX e CSV para Excel, CSV e OFX.",
+  "name": "Conversor de Extratos",
+  "short_name": "Conversor de Extratos",
+  "description": "Conversor e conciliador local de extratos bancários em PDF, OFX, CSV e XLSX para Excel, CSV e OFX.",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#0b1516",
